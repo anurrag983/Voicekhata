@@ -1,4 +1,4 @@
 <voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:sessionService="com.voicekhata.app.VoiceKhataSessionService"
     android:supportsAssist="false"
-    android:supportsLaunchFromKeyguard="false" />
+    android:supportsLaunchVoiceAssistFromKeyguard="true" />

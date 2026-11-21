@@ -8,3 +8,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 frontend/config.js
+android/.gradle/
+android/**/build/
+android/local.properties
+.DS_Store

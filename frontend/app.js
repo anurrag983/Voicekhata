@@ -46,6 +46,8 @@ let waveFrame = 0;
 let voiceLanguage = 'hi-IN';
 let gnaniSttEnabled = false;
 let gnaniTtsEnabled = false;
+let voiceCapabilitiesLoaded = false;
+let voiceCapabilitiesPromise = null;
 let voiceSpaceHeld = false;
 let voiceSpaceReleasedWhileStarting = false;
 let voicePointerTimer = null;
@@ -228,6 +230,23 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function requestVoiceCapabilities() {
+  if (voiceCapabilitiesLoaded) {
+    return Promise.resolve({ speech_to_text: gnaniSttEnabled, speech_output: gnaniTtsEnabled });
+  }
+  if (voiceCapabilitiesPromise) return voiceCapabilitiesPromise;
+  voiceCapabilitiesPromise = api('/api/v1/voice/capabilities')
+    .then((capabilities) => {
+      gnaniSttEnabled = Boolean(capabilities.speech_to_text);
+      gnaniTtsEnabled = Boolean(capabilities.speech_output);
+      voiceCapabilitiesLoaded = true;
+      return capabilities;
+    })
+    .catch(() => null)
+    .finally(() => { voiceCapabilitiesPromise = null; });
+  return voiceCapabilitiesPromise;
+}
+
 function decodeWavChunk(encoded) {
   const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
   if (bytes.length < 44) return null;
@@ -387,6 +406,7 @@ async function authenticate(path, payload) {
     await loadWorkspace();
     showApp();
     renderAll();
+    void requestVoiceCapabilities();
     startAssistantVoiceWhenReady();
     toast(path.endsWith('/register') ? 'Shop account created' : 'You are logged in');
   } catch (error) {
@@ -1858,18 +1878,19 @@ async function startListening() {
   const keepGestureButtonActive = voicePointerHoldActive;
   if (!keepGestureButtonActive) $('#voice-button').disabled = true;
   try {
-    const capabilities = await api('/api/v1/voice/capabilities');
-    gnaniSttEnabled = Boolean(capabilities.speech_to_text);
-    gnaniTtsEnabled = Boolean(capabilities.speech_output);
-    if (capabilities.speech_to_text && window.MediaRecorder && (window.AudioContext || window.webkitAudioContext)) {
+    const capabilitiesWereChecked = voiceCapabilitiesLoaded;
+    void requestVoiceCapabilities();
+    if ((!capabilitiesWereChecked || gnaniSttEnabled)
+        && window.MediaRecorder && (window.AudioContext || window.webkitAudioContext)) {
+      // Start microphone capture immediately. Do not make the shopkeeper wait
+      // for a sleeping API just to begin speaking; transcription is sent after
+      // the recording is complete and can wake the backend then.
       await startGnaniRecording();
       return;
     }
-    if (capabilities.speech_to_text && !window.MediaRecorder) toast('This browser cannot record audio for Gnani. Trying its built-in speech recognition.');
+    if (!window.MediaRecorder && gnaniSttEnabled) toast('This browser cannot record audio for Gnani. Trying its built-in speech recognition.');
     await startBrowserRecognition();
   } catch (error) {
-    gnaniSttEnabled = false;
-    gnaniTtsEnabled = false;
     toast(error.message || 'Could not check voice service. Use New entry instead.');
   } finally {
     startingVoice = false;
@@ -1888,6 +1909,14 @@ function beginGestureVoiceCapture(onStarted = null) {
 function startAssistantVoiceWhenReady() {
   if (!assistantVoiceLaunchPending || $('#app-shell').hidden || startingVoice || listening || awaitingVoiceReply || pendingVoiceEntry) return;
   assistantVoiceLaunchPending = false;
+  if (window.VoiceKhataNative?.hasPendingAudio?.()) {
+    window.voiceKhataNativeAudioReady();
+    return;
+  }
+  // The native Android companion records immediately with AudioRecord. It
+  // hands the WAV back here so the normal Gnani and confirmation flow remains
+  // the single path that can create a ledger transaction.
+  if (window.VoiceKhataNative?.startCapture?.()) return;
   startListening();
 }
 // Native Android assistant integrations call this after opening the app from
@@ -1897,6 +1926,19 @@ window.voiceKhataAssistantLaunch = () => {
   assistantVoiceLaunchPending = true;
   startAssistantVoiceWhenReady();
   return true;
+};
+window.voiceKhataNativeAudioReady = () => {
+  try {
+    const encoded = window.VoiceKhataNative?.consumeAudioBase64?.();
+    if (!encoded) throw new Error('The recording is no longer available. Please record again.');
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    void transcribeGnaniAudio(new Blob([bytes], { type: 'audio/wav' }));
+  } catch (error) {
+    setVoiceReady('The recording could not be opened. Please try again.');
+    toast(error.message || 'The recording could not be opened.');
+  }
 };
 document.addEventListener('keydown', (event) => {
   if (event.code !== 'Space' || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
@@ -1977,6 +2019,7 @@ async function bootstrap() {
     await loadWorkspace();
     showApp();
     renderAll();
+    void requestVoiceCapabilities();
     startAssistantVoiceWhenReady();
   } catch (error) {
     showAuth(error.message === 'Invalid or expired access token' ? 'Your session expired. Please log in again.' : `Could not connect to backend: ${error.message}`);
