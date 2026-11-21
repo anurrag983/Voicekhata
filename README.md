@@ -29,7 +29,7 @@ By default, local data is stored in `voicekhata.db`. To use PostgreSQL, set `DAT
 3. Create customers with `POST /api/v1/customers`.
 4. Add entries with `POST /api/v1/ledger/entries`; `entry_type` is `udhaar` or `jama`.
 5. Load a customer's history and calculated balance from `GET /api/v1/customers/{customer_id}/ledger`.
-6. For voice: upload `audio` plus `language_code` to `POST /api/v1/voice/sessions`. Show the returned transcript, let the merchant select the customer and verify amount/type, then call `/api/v1/voice/sessions/{session_id}/confirm`. The backend saves only after explicit confirmation. Use `/cancel` to discard a pending session.
+6. For voice: upload `audio` plus `language_code` to `POST /api/v1/voice/sessions`. The frontend asks follow-up questions for missing details and old/new customer identity, reads the complete entry aloud, and calls `/api/v1/voice/sessions/{session_id}/confirm` only after spoken confirmation. Use `/cancel` to discard a pending session.
 7. `POST /api/v1/voice/speak` with `{ "text", "language_code" }` returns Gnani's SSE audio stream for playback.
 
 Voice uploads are processed in memory and not stored. The recognized transcript and session state are retained for the ledger audit trail. This starter does not infer or commit an amount from transcript text; the frontend must show the transcript and collect explicit structured confirmation to avoid incorrect financial entries.

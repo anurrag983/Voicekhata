@@ -9,6 +9,7 @@ let customers = [];
 let transactions = [];
 let profile = { shopName: '', ownerName: '', location: '' };
 let pendingVoiceEntry = null;
+let voiceConversation = null;
 let recognition = null;
 let listening = false;
 let micStream = null;
@@ -36,6 +37,20 @@ const dateKey = (value) => {
 };
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const normaliseCustomerName = (value) => String(value ?? '').normalize('NFC').trim().toLocaleLowerCase('en-IN').replace(/\s+/g, ' ');
+const COMMAND_FILLER_WORDS = new Set([
+  'rupee', 'rupees', 'rupaye', 'rupya', 'rs', 'paisa', 'paise', 'ka', 'ke', 'ko', 'se', 'ne', 'par',
+  'udhaar', 'udhar', 'credit', 'debit', 'jama', 'mile', 'mila', 'likho', 'likh', 'entry', 'received',
+  'payment', 'paid', 'vasool', 'add', 'record', 'aaj', 'today', 'hai', 'hain', 'tha', 'the', 'name', 'customer', 'kiye', 'kiya', 'diya', 'diye', 'liya', 'liye', 'kar', 'karo',
+  'रुपये', 'रुपए', 'रुपया', 'रुपयों', 'पैसे', 'पैसा', 'पैसों', 'लिखो', 'लिख', 'जमा', 'उधार', 'उधर', 'उधारी',
+  'मिले', 'मिला', 'किए', 'किया', 'दिए', 'दिया', 'लिए', 'लिया', 'कर', 'करो', 'हुआ', 'हुई', 'आज', 'है', 'हैं', 'थे', 'था', 'का', 'के', 'को', 'ने', 'से', 'पर', 'नाम', 'ग्राहक',
+]);
+function commandCustomerName(value) {
+  return [...String(value || '').normalize('NFC').matchAll(/[\p{L}\p{M}]+/gu)]
+    .map((match) => match[0])
+    .filter((word) => !COMMAND_FILLER_WORDS.has(word.toLocaleLowerCase('en-IN')))
+    .join(' ')
+    .trim();
+}
 function namesOneEditApart(left, right) {
   const a = Array.from(normaliseCustomerName(left));
   const b = Array.from(normaliseCustomerName(right));
@@ -102,6 +117,7 @@ function showAuth(message = '') {
   if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   $$('dialog[open]').forEach((dialog) => dialog.close());
   pendingVoiceEntry = null;
+  voiceConversation = null;
   $('#app-shell').hidden = true;
   $('#auth-screen').hidden = false;
   setAuthMode('login');
@@ -477,7 +493,7 @@ function openEntry(selectedCustomerId = '', draft = null) {
   if (draft) {
     if (!draft.customerId || draft.ambiguousCustomerIds?.length > 1) $('#transaction-customer').value = '';
     $('#transaction-type').value = draft.type === 'payment' ? 'payment' : 'credit';
-    $('#transaction-amount').value = String(draft.amount);
+    $('#transaction-amount').value = draft.amount == null ? '' : String(draft.amount);
     $('#transaction-note').value = draft.raw || '';
   }
   $('#transaction-dialog').showModal();
@@ -680,21 +696,22 @@ function parseCommand(raw) {
   if (!text) return null;
   const numeric = text.match(/(?:₹\s*)?(\d[\d,]*(?:\.\d{1,2})?)/);
   let amount;
-  let amountSpan;
+  let amountSpan = [text.length, text.length];
   if (numeric) {
     amount = Number(numeric[1].replace(/,/g, ''));
     amountSpan = [numeric.index, numeric.index + numeric[0].length];
   } else {
     const word = spokenAmount(text);
-    if (!word) return { error: 'I couldn’t find an amount. Please say it clearly and try again.' };
-    amount = word.value;
-    amountSpan = [word.charStart, word.charEnd];
+    if (word) {
+      amount = word.value;
+      amountSpan = [word.charStart, word.charEnd];
+    }
   }
-  if (!Number.isFinite(amount) || amount <= 0) return { error: 'Please give an amount greater than zero.' };
-  let customerText = `${text.slice(0, amountSpan[0])} ${text.slice(amountSpan[1])}`;
-  customerText = customerText.replace(/\b(?:rupaye|rupees|rs\.?|ka|ke|ko|se|ne|par|udhaar|udhar|credit|debit|jama|mile|mila|likho|likh|entry|received|payment|paid|vasool|add|record|aaj|today|hai|hain|tha|the)\b/giu, ' ');
-  customerText = customerText.replace(/(?:रुपये|रुपए|रुपया|लिखो|लिख|जमा|उधार|उधर|उधारी|मिले|मिला|आज|है|थे|था|का|के|को)/gu, ' ').replace(/₹/g, ' ').replace(/[.,!?]/g, ' ').trim().replace(/\s+/g, ' ');
+  if (amount !== undefined && amount !== null && (!Number.isFinite(amount) || amount <= 0)) return { error: 'Please give an amount greater than zero.' };
+  const customerText = commandCustomerName(`${text.slice(0, amountSpan[0])} ${text.slice(amountSpan[1])}`);
   const isPayment = /(jama|mil[eai]|paid|payment|received|vasool|जमा|मिले|मिला)/iu.test(text);
+  const isCredit = /(udhaar|udhar|credit|उधार|उधर|उधारी|लिखो|लिख)/iu.test(text);
+  const typeSpecified = isPayment || isCredit;
   const normalized = normaliseCustomerName(customerText);
   const matches = customers.filter((customer) => normalized === normaliseCustomerName(customer.name));
   const suggestions = matches.length ? [] : customers.filter((customer) => namesOneEditApart(normalized, customer.name));
@@ -706,8 +723,9 @@ function parseCommand(raw) {
     customerId: matches.length === 1 ? matches[0].id : null,
     ambiguousCustomerIds: matches.length > 1 ? matches.map((customer) => customer.id) : [],
     suggestedCustomerIds: suggestions.map((customer) => customer.id),
-    amount,
+    amount: amount ?? null,
     type: isPayment ? 'payment' : 'credit',
+    typeSpecified,
     raw: raw.trim(),
   };
 }
@@ -802,22 +820,240 @@ function voiceConfirmationPrompt(entry) {
     : `${entry.customer}, ${amount} रुपये ${relation}। नया खाता बनाकर सेव करने के लिए हाँ बोलें। रद्द करने के लिए नहीं बोलें।`;
 }
 function beginVoiceConfirmation(entry) {
+  voiceConversation = { entry, customerResolved: false, candidates: [], candidateKind: '', newCustomerName: '' };
+  pendingVoiceEntry = entry;
+  advanceVoiceConversation();
+}
+function fallbackConversationToForm(entry, message) {
+  stopVoiceReply();
+  cancelVoiceSession(entry.sessionId);
+  pendingVoiceEntry = null;
+  voiceConversation = null;
+  if (message) toast(`${message} I’m opening the entry form so you can finish safely.`);
+  openManualCorrection(entry);
+}
+function askConversationQuestion(entry, prompt, onAnswer) {
   pendingVoiceEntry = entry;
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition || (!('speechSynthesis' in window) && !gnaniTtsEnabled)) {
-    showVoiceConfirmation(entry);
-    toast('Hands-free confirmation is not available in this browser.');
+    fallbackConversationToForm(entry, 'Hands-free questions are not available in this browser.');
     return;
   }
   awaitingVoiceReply = true;
-  $('#voice-title').textContent = 'Please confirm by voice';
-  $('#voice-subtitle').textContent = 'Listen to the summary, then say haan or nahi.';
-  $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Speaking your entry details…</span>';
-  speakText(voiceConfirmationPrompt(entry)).then((played) => {
+  $('#voice-title').textContent = 'Please answer by voice';
+  $('#voice-subtitle').textContent = 'I will ask one question at a time.';
+  $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Speaking a question…</span>';
+  speakText(prompt).then((played) => {
     if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
-    if (!played) { showVoiceReplyFallback(entry, 'Could not play the voice summary.'); return; }
-    listenForVoiceConfirmation(entry, SpeechRecognition, 0);
+    if (!played) { fallbackConversationToForm(entry, 'Could not play the voice question.'); return; }
+    listenForVoiceConfirmation(entry, SpeechRecognition, 0, onAnswer, (message) => fallbackConversationToForm(entry, message));
   });
+}
+function transcriptWords(value) {
+  return [...String(value || '').normalize('NFC').toLocaleLowerCase('en-IN').matchAll(/[\p{L}\p{M}]+/gu)].map((match) => match[0]);
+}
+function responseHas(words, options) { return words.some((word) => options.has(word)); }
+function parseAmountReply(raw) {
+  const text = normaliseDigits(String(raw || '').trim());
+  const numeric = text.match(/(?:₹\s*)?(\d[\d,]*(?:\.\d{1,2})?)/);
+  if (numeric) {
+    const amount = Number(numeric[1].replace(/,/g, ''));
+    return Number.isFinite(amount) && amount > 0 ? amount : null;
+  }
+  const spoken = spokenAmount(text);
+  return spoken?.value > 0 ? spoken.value : null;
+}
+function cleanCustomerNameReply(raw) {
+  const withoutPolitePhrase = normaliseDigits(String(raw || ''))
+    .replace(/(?:नाम से सेव कर दो|नाम सेव कर दो|save (?:it )?as|save (?:this )?name|सेव कर दो|सेव करो|save it|save)/giu, ' ')
+    .replace(/\b\d[\d,]*(?:\.\d{1,2})?\b/gu, ' ')
+    .replace(/^(?:नया|नयी|नए|new)\s+/iu, ' ');
+  return commandCustomerName(withoutPolitePhrase);
+}
+function voiceIntent(words) {
+  const yes = responseHas(words, new Set(['yes', 'yeah', 'haan', 'han', 'हाँ', 'हां', 'हा', 'जी', 'सही', 'ठीक']));
+  const no = responseHas(words, new Set(['no', 'nahi', 'nahin', 'नहीं', 'नही', 'ना', 'रद्द', 'cancel']));
+  const old = responseHas(words, new Set(['old', 'existing', 'purana', 'purani', 'purane', 'पहले', 'पहला', 'पुराना', 'पुरानी', 'पुराने', 'वही']));
+  const isNew = responseHas(words, new Set(['new', 'naya', 'nayi', 'naye', 'नया', 'नयी', 'नए', 'नया']));
+  return { yes, no, old, isNew };
+}
+function resolveVoiceCustomer(customer) {
+  const state = voiceConversation;
+  if (!state) return;
+  state.entry.customer = customer.name;
+  state.entry.customerId = customer.id;
+  state.entry.ambiguousCustomerIds = [];
+  state.entry.suggestedCustomerIds = [];
+  state.customerResolved = true;
+  advanceVoiceConversation();
+}
+function setVoiceCustomerCandidates(candidates, kind) {
+  const state = voiceConversation;
+  if (!state) return;
+  state.candidates = candidates;
+  state.candidateKind = kind;
+  state.entry.customerId = null;
+  state.entry.ambiguousCustomerIds = kind === 'exact' && candidates.length > 1 ? candidates.map((customer) => customer.id) : [];
+  state.entry.suggestedCustomerIds = kind === 'similar' ? candidates.map((customer) => customer.id) : [];
+}
+function beginNewVoiceCustomerName(requireDistinct) {
+  const state = voiceConversation;
+  if (!state) return;
+  const name = state.entry.customer;
+  const prompt = requireDistinct
+    ? `${name} नाम पहले से है। नए ग्राहक को किस अलग नाम से सेव करूँ? उदाहरण: ${name} - दूध वाले।`
+    : `नए ग्राहक को ${name} नाम से सेव करूँ? हाँ बोलें, या कोई अलग पहचान वाला नाम बोलें।`;
+  askConversationQuestion(state.entry, prompt, (heard) => {
+    const words = transcriptWords(heard);
+    const intent = voiceIntent(words);
+    if (!requireDistinct && intent.yes) {
+      state.newCustomerName = name;
+      state.entry.customer = name;
+      state.entry.customerId = null;
+      state.entry.suggestedCustomerIds = [];
+      state.entry.ambiguousCustomerIds = [];
+      state.customerResolved = true;
+      advanceVoiceConversation();
+      return;
+    }
+    const candidateName = cleanCustomerNameReply(heard);
+    if (!requireDistinct && intent.no) {
+      askConversationQuestion(state.entry, `ठीक है। ग्राहक का अलग नाम बताइए, जैसे ${name} - दूध वाले।`, (differentName) => {
+        const resolvedName = cleanCustomerNameReply(differentName);
+        if (!resolvedName || customers.some((customer) => normaliseCustomerName(customer.name) === normaliseCustomerName(resolvedName))) {
+          beginNewVoiceCustomerName(true);
+          return;
+        }
+        state.newCustomerName = resolvedName;
+        state.entry.customer = resolvedName;
+        state.entry.customerId = null;
+        state.entry.suggestedCustomerIds = [];
+        state.entry.ambiguousCustomerIds = [];
+        state.customerResolved = true;
+        advanceVoiceConversation();
+      });
+      return;
+    }
+    if (!candidateName || candidateName.length > 120) {
+      beginNewVoiceCustomerName(requireDistinct);
+      return;
+    }
+    if (requireDistinct && intent.no) {
+      beginNewVoiceCustomerName(true);
+      return;
+    }
+    const duplicate = customers.some((customer) => normaliseCustomerName(customer.name) === normaliseCustomerName(candidateName));
+    if (duplicate) {
+      state.entry.customer = candidateName;
+      beginNewVoiceCustomerName(true);
+      return;
+    }
+    state.newCustomerName = candidateName;
+    state.entry.customer = candidateName;
+    state.entry.customerId = null;
+    state.entry.suggestedCustomerIds = [];
+    state.entry.ambiguousCustomerIds = [];
+    state.customerResolved = true;
+    advanceVoiceConversation();
+  });
+}
+function startVoiceCustomerResolution() {
+  const state = voiceConversation;
+  if (!state) return;
+  const entry = state.entry;
+  const exact = customers.filter((customer) => normaliseCustomerName(customer.name) === normaliseCustomerName(entry.customer));
+  const similar = exact.length ? [] : customers.filter((customer) => (entry.suggestedCustomerIds || []).includes(customer.id));
+  const candidates = exact.length ? exact : similar;
+  if (candidates.length) {
+    const kind = exact.length ? 'exact' : 'similar';
+    setVoiceCustomerCandidates(candidates, kind);
+    const details = candidates.map((customer) => customer.phone
+      ? `${customer.name}, फोन के आखिरी चार अंक ${customer.phone.replace(/\D/g, '').slice(-4)}`
+      : customer.name).join(' या ');
+    const prompt = exact.length
+      ? `${entry.customer} नाम का खाता पहले से है। पुराना ${details} इस्तेमाल करना है या नया ग्राहक है? पुराना या नया बोलें।`
+      : `मैंने ${entry.customer} सुना। मिलता-जुलता पुराना खाता ${details} है। पुराना खाता इस्तेमाल करना है या नया ग्राहक है? पुराना या नया बोलें।`;
+    askConversationQuestion(entry, prompt, (heard) => {
+      const words = transcriptWords(heard);
+      const intent = voiceIntent(words);
+      if (intent.old) {
+        if (candidates.length === 1) { resolveVoiceCustomer(candidates[0]); return; }
+        const selected = voiceReplyChoice(entry, heard);
+        if (selected) { resolveVoiceCustomer(selected); return; }
+        askConversationQuestion(entry, `कई पुराने खाते मिले। सही खाते का फोन नंबर, आखिरी चार अंक बोलें।`, (accountReply) => {
+          const choice = voiceReplyChoice(entry, accountReply);
+          if (choice) resolveVoiceCustomer(choice);
+          else fallbackConversationToForm(entry, 'I could not identify the old account.');
+        });
+        return;
+      }
+      if (intent.isNew) { beginNewVoiceCustomerName(true); return; }
+      askConversationQuestion(entry, `पुराना ${entry.customer} या नया ग्राहक बोलें।`, arguments_ => {
+        const next = voiceIntent(transcriptWords(arguments_));
+        if (next.old && candidates.length === 1) resolveVoiceCustomer(candidates[0]);
+        else if (next.isNew) beginNewVoiceCustomerName(true);
+        else fallbackConversationToForm(entry, 'I could not tell which customer you meant.');
+      });
+    });
+    return;
+  }
+  setVoiceCustomerCandidates([], 'new');
+  askConversationQuestion(entry, `${entry.customer} का पुराना खाता नहीं मिला। क्या यह नया ग्राहक है? हाँ या नहीं बोलें।`, (heard) => {
+    const intent = voiceIntent(transcriptWords(heard));
+    if (intent.yes || intent.isNew) { beginNewVoiceCustomerName(false); return; }
+    if (intent.no) {
+      askConversationQuestion(entry, `पुराने ग्राहक का पूरा नाम बोलें।`, (nameReply) => {
+        const oldName = cleanCustomerNameReply(nameReply);
+        if (!oldName) { fallbackConversationToForm(entry, 'I could not hear the customer name.'); return; }
+        entry.customer = oldName;
+        entry.suggestedCustomerIds = [];
+        startVoiceCustomerResolution();
+      });
+      return;
+    }
+    startVoiceCustomerResolution();
+  });
+}
+function advanceVoiceConversation() {
+  const state = voiceConversation;
+  if (!state) return;
+  const entry = state.entry;
+  if (entry.amount == null) {
+    askConversationQuestion(entry, `कितने रुपये की एंट्री करनी है?`, (heard) => {
+      const amount = parseAmountReply(heard);
+      if (!amount) {
+        askConversationQuestion(entry, `रुपयों की संख्या साफ बोलें, जैसे पाँच सौ।`, (retry) => {
+          const retryAmount = parseAmountReply(retry);
+          if (!retryAmount) fallbackConversationToForm(entry, 'I could not understand the amount.');
+          else { entry.amount = retryAmount; advanceVoiceConversation(); }
+        });
+      } else { entry.amount = amount; advanceVoiceConversation(); }
+    });
+    return;
+  }
+  if (!entry.typeSpecified) {
+    askConversationQuestion(entry, `यह उधार है या जमा पेमेंट?`, (heard) => {
+      const words = transcriptWords(heard);
+      if (responseHas(words, new Set(['उधार', 'उधर', 'उधारी', 'udhaar', 'udhar', 'credit']))) {
+        entry.type = 'credit'; entry.typeSpecified = true; advanceVoiceConversation(); return;
+      }
+      if (responseHas(words, new Set(['जमा', 'jama', 'payment', 'paid', 'मिले', 'मिला', 'received']))) {
+        entry.type = 'payment'; entry.typeSpecified = true; advanceVoiceConversation(); return;
+      }
+      askConversationQuestion(entry, `कृपया साफ बोलें: उधार या जमा?`, (retry) => {
+        const next = transcriptWords(retry);
+        if (responseHas(next, new Set(['उधार', 'उधर', 'उधारी', 'udhaar', 'udhar', 'credit']))) { entry.type = 'credit'; entry.typeSpecified = true; advanceVoiceConversation(); }
+        else if (responseHas(next, new Set(['जमा', 'jama', 'payment', 'paid', 'मिले', 'मिला', 'received']))) { entry.type = 'payment'; entry.typeSpecified = true; advanceVoiceConversation(); }
+        else fallbackConversationToForm(entry, 'I could not understand udhaar or payment.');
+      });
+    });
+    return;
+  }
+  if (!state.customerResolved) { startVoiceCustomerResolution(); return; }
+  entry.customer = state.newCustomerName || entry.customer;
+  pendingVoiceEntry = entry;
+  voiceConversation = null;
+  askConversationQuestion(entry, voiceConfirmationPrompt(entry), (heard) => handleVoiceConfirmationReply(entry, heard, window.SpeechRecognition || window.webkitSpeechRecognition, 0));
 }
 function stopVoiceReply() {
   awaitingVoiceReply = false;
@@ -832,7 +1068,7 @@ function showVoiceReplyFallback(entry, message) {
   showVoiceConfirmation(entry);
   if (message) toast(`${message} Use the confirmation controls on screen.`);
 }
-function listenForVoiceConfirmation(entry, SpeechRecognition, attempt) {
+function listenForVoiceConfirmation(entry, SpeechRecognition, attempt, onReply = null, onFallback = null) {
   if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
   let reply;
   try {
@@ -845,15 +1081,25 @@ function listenForVoiceConfirmation(entry, SpeechRecognition, attempt) {
     reply.onresult = (event) => {
       const heard = Array.from(event.results).map((result) => result[0].transcript).join(' ').trim();
       stopVoiceReply();
-      handleVoiceConfirmationReply(entry, heard, SpeechRecognition, attempt);
+      if (onReply) onReply(heard);
+      else handleVoiceConfirmationReply(entry, heard, SpeechRecognition, attempt);
     };
     reply.onerror = (event) => {
-      if (awaitingVoiceReply) showVoiceReplyFallback(entry, event.error === 'not-allowed' ? 'Allow microphone access to confirm by voice.' : 'I could not hear your answer.');
+      if (awaitingVoiceReply) {
+        if (onFallback) { stopVoiceReply(); onFallback(event.error === 'not-allowed' ? 'Allow microphone access to confirm by voice.' : 'I could not hear your answer.'); }
+        else showVoiceReplyFallback(entry, event.error === 'not-allowed' ? 'Allow microphone access to confirm by voice.' : 'I could not hear your answer.');
+      }
     };
     reply.onend = () => {
-      if (awaitingVoiceReply) showVoiceReplyFallback(entry, 'I did not hear an answer.');
+      if (awaitingVoiceReply) {
+        if (onFallback) { stopVoiceReply(); onFallback('I did not hear an answer.'); }
+        else showVoiceReplyFallback(entry, 'I did not hear an answer.');
+      }
     };
-    voiceReplyTimer = setTimeout(() => showVoiceReplyFallback(entry, 'I did not hear an answer.'), 10000);
+    voiceReplyTimer = setTimeout(() => {
+      if (onFallback) { stopVoiceReply(); onFallback('I did not hear an answer.'); }
+      else showVoiceReplyFallback(entry, 'I did not hear an answer.');
+    }, 10000);
     reply.start();
   } catch {
     showVoiceReplyFallback(entry, 'Voice confirmation could not start.');
@@ -880,6 +1126,7 @@ function handleVoiceConfirmationReply(entry, heard, SpeechRecognition, attempt) 
   const yesWords = new Set(['yes', 'yeah', 'haan', 'han', 'हाँ', 'हां', 'हा', 'जी', 'सही', 'ठीक', 'save', 'confirm']);
   if (words.some((word) => noWords.has(word))) {
     pendingVoiceEntry = null;
+    voiceConversation = null;
     cancelVoiceSession(entry.sessionId);
     setVoiceReady('Entry cancelled. Nothing was saved.');
     speakText(voiceLanguage === 'hi-IN' ? 'ठीक है, एंट्री रद्द कर दी। कुछ सेव नहीं हुआ।' : 'Okay, the entry is cancelled. Nothing was saved.');
@@ -928,6 +1175,7 @@ function dismissVoiceConfirmation() {
   stopVoiceReply();
   if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   pendingVoiceEntry = null;
+  voiceConversation = null;
   cancelVoiceSession(sessionId);
   setVoiceReady();
 }
@@ -952,6 +1200,7 @@ $('#confirm-transaction').addEventListener('click', async () => {
   confirmButton.disabled = true;
   const entry = pendingVoiceEntry;
   pendingVoiceEntry = null;
+  voiceConversation = null;
   if ($('#confirm-dialog').open) $('#confirm-dialog').close();
   try {
     let customerId = entry.customerId;
@@ -1300,7 +1549,8 @@ $('#voice-button').addEventListener('click', () => {
     const entry = pendingVoiceEntry;
     stopVoiceReply();
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-    if (entry) showVoiceConfirmation(entry);
+    if (entry && voiceConversation) fallbackConversationToForm(entry, 'Voice questions stopped.');
+    else if (entry) showVoiceConfirmation(entry);
     return;
   }
   if (!listening) { startListening(); return; }

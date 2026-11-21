@@ -99,7 +99,7 @@ Each ledger entry includes `created_at` as an ISO 8601 UTC timestamp (ending in 
 
 Upload audio as multipart form data to `POST /api/v1/voice/sessions`, with fields `audio` (file) and `language_code` (for example `hi-IN`). The response contains the recognized transcript and an `id` for the pending voice session.
 
-Show the transcript and let the merchant select the customer, amount, and entry type. Only after the merchant confirms, call `POST /api/v1/voice/sessions/{session_id}/confirm` with:
+Use the transcript to ask for any missing amount or entry type. Confirm whether a matching customer is the existing person or a new person; new same-name people need a distinguishing name. Read the resolved customer, amount, and type aloud and only call `POST /api/v1/voice/sessions/{session_id}/confirm` after an explicit spoken yes. Use the `/cancel` route when the user says no or abandons the entry. The session response returns its identifier as `id`:
 
 ```json
 {"customer_id":"<customer id>","amount":340,"entry_type":"udhaar","note":"voice entry"}
