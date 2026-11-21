@@ -1,0 +1,32 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.voicekhata.app'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.voicekhata.app'
+        // VoiceInteractionService exists from API 21. Assistant-role selection
+        // is detected at runtime because RoleManager starts at API 29.
+        minSdk 21
+        targetSdk 36
+        versionCode 1
+        versionName '1.0.0'
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix '.debug'
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

@@ -136,6 +136,53 @@ def voice_capabilities(merchant: Merchant = Depends(get_current_merchant)):
     return {"speech_to_text": enabled, "speech_output": enabled}
 
 
+async def transcribe_gnani_audio(content: bytes, filename: str, content_type: str, language_code: str) -> tuple[str, str]:
+    gnani_api_key = (settings.gnani_api_key or "").strip()
+    if not gnani_api_key:
+        raise HTTPException(status_code=503, detail="Voice transcription is not configured on the server")
+    language = language_code.strip() or "hi-IN"
+    form = {
+        "language_code": language,
+        "preferred_language": language,
+        "format": "codemix",
+        "itn_native_numerals": "true",
+        "topic": "An Indian shop ledger entry in Hindi and Hinglish. Customer names, rupee amounts, udhaar (credit), and jama (payment).",
+    }
+    if settings.gnani_stt_model:
+        form["model"] = settings.gnani_stt_model
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            upstream = await client.post(
+                settings.gnani_stt_url,
+                headers={"X-API-Key-ID": gnani_api_key},
+                data=form,
+                files={"audio_file": (filename, content, content_type or "application/octet-stream")},
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Gnani took too long to transcribe this recording. Please try a shorter recording.")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Could not connect to Gnani. Check your internet connection and try again.")
+    if upstream.is_error:
+        if upstream.status_code in {401, 403}:
+            detail = "Gnani rejected the API credentials. Check the GNANI_API_KEY in the backend .env file."
+        elif upstream.status_code in {400, 413, 415, 422}:
+            detail = "Gnani could not process this audio. Keep the recording under 30 seconds and speak clearly."
+        elif upstream.status_code == 429:
+            detail = "Gnani is receiving too many requests. Wait a moment and try again."
+        else:
+            detail = f"Gnani transcription failed (HTTP {upstream.status_code}). Please try again shortly."
+        raise HTTPException(status_code=502, detail=detail)
+    try:
+        result = upstream.json()
+        transcript = result.get("transcript", "").strip()
+        detected_language = result.get("detected_language_code") or language
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=502, detail="Gnani returned an invalid transcription response. Please try again.")
+    if not transcript:
+        raise HTTPException(status_code=422, detail="No speech was recognized. Move closer to the microphone and try again.")
+    return transcript, detected_language
+
+
 @app.post("/api/v1/auth/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED)
 def register(payload: MerchantCreate, db: Session = Depends(get_db)):
     merchant = Merchant(
@@ -304,16 +351,7 @@ def get_customer_ledger(customer_id: UUID, db: Session = Depends(get_db), mercha
     return LedgerSummary(customer=customer_out, entries=entries, balance=customer_out.balance)
 
 
-@app.post("/api/v1/voice/sessions", response_model=VoiceSessionOut, status_code=status.HTTP_201_CREATED)
-async def transcribe_voice(
-    audio: UploadFile = File(...),
-    language_code: str = Form("hi-IN"),
-    db: Session = Depends(get_db),
-    merchant: Merchant = Depends(get_current_merchant),
-):
-    gnani_api_key = (settings.gnani_api_key or "").strip()
-    if not gnani_api_key:
-        raise HTTPException(status_code=503, detail="Voice transcription is not configured on the server")
+async def read_voice_upload(audio: UploadFile) -> tuple[bytes, str, str]:
     allowed_types = {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/ogg", "audio/flac", "audio/aac", "audio/mp4", "audio/x-m4a", "application/octet-stream"}
     content_type = (audio.content_type or "").split(";", 1)[0].strip().lower()
     if content_type and content_type not in allowed_types:
@@ -323,31 +361,30 @@ async def transcribe_voice(
         raise HTTPException(status_code=400, detail="Audio file is empty")
     if len(content) > settings.max_audio_bytes:
         raise HTTPException(status_code=413, detail=f"Audio file exceeds the {settings.max_audio_bytes // (1024 * 1024)} MB limit")
-    filename = audio.filename or "voice-upload.wav"
-    form = {"language_code": language_code.strip()}
-    if settings.gnani_stt_model:
-        form["model"] = settings.gnani_stt_model
-    try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            upstream = await client.post(
-                settings.gnani_stt_url,
-                headers={"X-API-Key-ID": gnani_api_key},
-                data=form,
-                files={"audio_file": (filename, content, audio.content_type or "application/octet-stream")},
-            )
-    except httpx.HTTPError:
-        raise HTTPException(status_code=502, detail="Could not reach the speech recognition service")
-    if upstream.is_error:
-        # Do not send provider details or credentials back to the browser.
-        raise HTTPException(status_code=502, detail="Speech recognition failed; check Gnani access and try again")
-    try:
-        result = upstream.json()
-        transcript = result.get("transcript", "").strip()
-        detected_language = result.get("detected_language_code") or language_code
-    except (ValueError, AttributeError):
-        raise HTTPException(status_code=502, detail="Speech recognition returned an invalid response")
-    if not transcript:
-        raise HTTPException(status_code=422, detail="No speech was recognized; please try again")
+    return content, audio.filename or "voice-upload.wav", audio.content_type or "application/octet-stream"
+
+
+@app.post("/api/v1/voice/transcribe")
+async def transcribe_voice_reply(
+    audio: UploadFile = File(...),
+    language_code: str = Form("hi-IN"),
+    merchant: Merchant = Depends(get_current_merchant),
+):
+    del merchant
+    content, filename, content_type = await read_voice_upload(audio)
+    transcript, detected_language = await transcribe_gnani_audio(content, filename, content_type, language_code)
+    return {"transcript": transcript, "detected_language_code": detected_language}
+
+
+@app.post("/api/v1/voice/sessions", response_model=VoiceSessionOut, status_code=status.HTTP_201_CREATED)
+async def transcribe_voice(
+    audio: UploadFile = File(...),
+    language_code: str = Form("hi-IN"),
+    db: Session = Depends(get_db),
+    merchant: Merchant = Depends(get_current_merchant),
+):
+    content, filename, content_type = await read_voice_upload(audio)
+    transcript, detected_language = await transcribe_gnani_audio(content, filename, content_type, language_code)
     # Audio is processed in memory only; only transcript and status are retained.
     session = VoiceSession(merchant_id=merchant.id, transcript=transcript, language_code=detected_language,
                            status=VoiceStatus.pending_confirmation)

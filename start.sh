@@ -34,4 +34,4 @@ if [ ! -f .venv/.voicekhata-dependencies-installed ]; then
 fi
 
 HOST="${HOST:-127.0.0.1}"
-exec .venv/bin/uvicorn app.main:app --reload --reload-dir app --host "$HOST" --port 8000
+exec .venv/bin/python -m uvicorn app.main:app --reload --reload-dir app --host "$HOST" --port 8000
