@@ -4,22 +4,19 @@ FastAPI backend for merchant accounts, customers, udhaar/jama ledger entries, an
 
 ## Start locally
 
-Requires Python 3.11 or newer.
+Requires Python 3.9 or newer.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+./start.sh
 ```
 
-Set a private `SECRET_KEY` in `.env` (for example, generate one with `python -c 'import secrets; print(secrets.token_urlsafe(48))'`). Set `GNANI_API_KEY` to the key from your Gnani account to enable speech endpoints. The key stays on the server and is never returned to the browser.
+The script creates a virtual environment, installs dependencies, and creates `.env` with a private signing key if needed. Open <http://127.0.0.1:8000> after it starts. Set `GNANI_API_KEY` in `.env` to enable Gnani speech-to-text and speech output; the key stays on the server and is never returned to the browser. Restart the script after changing `.env`.
 
-```bash
-uvicorn app.main:app --reload
-```
+Interactive API docs are at <http://127.0.0.1:8000/docs>.
 
-Interactive API docs: <http://127.0.0.1:8000/docs>
+## Frontend
+
+The static UI is in `frontend/`. It now signs in against this API and loads customer balances and ledger history from the database. See [frontend/README.md](frontend/README.md) for setup or [FRONTEND_HANDOFF.md](FRONTEND_HANDOFF.md) for the API contract and two-Mac configuration.
 
 If you forget the local merchant password, run `./reset-password.sh` from the project folder. It prompts for the account email and a new password without displaying the password.
 

@@ -14,6 +14,8 @@ class MerchantCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     email: EmailStr
     password: str = Field(min_length=10, max_length=128)
+    owner_name: Optional[str] = Field(default=None, max_length=120)
+    location: Optional[str] = Field(default=None, max_length=160)
 
     @field_validator("name")
     @classmethod
@@ -22,6 +24,14 @@ class MerchantCreate(BaseModel):
         if not value:
             raise ValueError("Name cannot be blank")
         return value
+
+    @field_validator("owner_name", "location")
+    @classmethod
+    def trim_optional_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
 
 class MerchantLogin(BaseModel):
@@ -33,8 +43,26 @@ class MerchantOut(BaseModel):
     id: uuid.UUID
     name: str
     email: EmailStr
+    owner_name: Optional[str]
+    location: Optional[str]
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+
+class MerchantUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    owner_name: Optional[str] = Field(default=None, max_length=120)
+    location: Optional[str] = Field(default=None, max_length=160)
+
+    @field_validator("name", "owner_name", "location")
+    @classmethod
+    def trim_optional_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        return value
 
 
 class TokenOut(BaseModel):

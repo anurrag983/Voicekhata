@@ -1,6 +1,6 @@
 # VoiceKhata frontend handoff
 
-Use this contract to connect the UI to the backend. Local API base URL:
+The UI in `frontend/` now uses this contract. Local API base URL:
 
 ```text
 http://127.0.0.1:8000
@@ -36,7 +36,7 @@ Content-Type: application/json
 ```
 
 ```json
-{"name":"My Shop","email":"owner@example.com","password":"use-a-private-password"}
+{"name":"My Shop","owner_name":"Shop owner","location":"Area or city","email":"owner@example.com","password":"use-a-private-password"}
 ```
 
 For later sessions, log in:
@@ -50,13 +50,15 @@ Content-Type: application/json
 {"email":"owner@example.com","password":"use-a-private-password"}
 ```
 
-Both return `access_token`. Keep it in frontend session state and send it on each protected request:
+Shop name, owner, and location are saved on the merchant account during registration. Later logins need only email and password. Both auth routes return `access_token`. Keep it in frontend session state and send it on each protected request:
 
 ```http
 Authorization: Bearer <access_token>
 ```
 
 Never send the token or the Gnani API key in screenshots, source code, or chat. The Gnani key belongs only in the backend `.env` file.
+
+Update the saved shop profile when needed with `PATCH /api/v1/auth/me` and JSON fields `name`, `owner_name`, and `location`.
 
 ## 2. Customer and ledger flow
 
@@ -72,7 +74,10 @@ Content-Type: application/json
 {"name":"Ramesh","phone":"9876543210"}
 ```
 
+Customer names must be unique within one shop (case-insensitive). If a new person has the same name as an existing customer, ask for a distinguishing name such as `Ramesh - Doodh wale`; do not add a second identical name. Phone numbers must also be unique within that shop.
+
 List customers and balances: `GET /api/v1/customers` (optional search: `?q=Ram`).
+The overview and analytics load the shop's ledger history with `GET /api/v1/ledger/entries?limit=500&offset=0`; the UI requests additional pages when needed.
 
 Create an udhaar or repayment entry:
 
@@ -88,9 +93,11 @@ Content-Type: application/json
 
 `entry_type` must be `udhaar` or `jama`. Load history and current balance using `GET /api/v1/customers/{customer_id}/ledger`.
 
+Each ledger entry includes `created_at` as an ISO 8601 UTC timestamp (ending in `+00:00`). The frontend should convert it to the merchant's local timezone when displaying the date and time. Both udhaar and jama entries get their own timestamp automatically when saved.
+
 ## 3. Voice flow
 
-Upload audio as multipart form data to `POST /api/v1/voice/sessions`, with fields `audio` (file) and `language_code` (for example `hi-IN`). The response contains the recognized transcript and a `session_id`.
+Upload audio as multipart form data to `POST /api/v1/voice/sessions`, with fields `audio` (file) and `language_code` (for example `hi-IN`). The response contains the recognized transcript and an `id` for the pending voice session.
 
 Show the transcript and let the merchant select the customer, amount, and entry type. Only after the merchant confirms, call `POST /api/v1/voice/sessions/{session_id}/confirm` with:
 

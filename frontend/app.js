@@ -1,0 +1,1326 @@
+const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => [...document.querySelectorAll(selector)];
+const API_BASE = String(window.VOICEKHATA_CONFIG?.apiBaseUrl || window.location.origin).replace(/\/+$/, '');
+const TOKEN_KEY = 'voicekhata.access_token';
+const PENDING_ENTRY_KEY = 'voicekhata.pending_entry';
+let token = sessionStorage.getItem(TOKEN_KEY) || '';
+let merchant = null;
+let customers = [];
+let transactions = [];
+let profile = { shopName: '', ownerName: '', location: '' };
+let pendingVoiceEntry = null;
+let recognition = null;
+let listening = false;
+let micStream = null;
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingTimer = null;
+let processRecordingOnStop = false;
+let startingVoice = false;
+let awaitingVoiceReply = false;
+let voiceReplyRecognition = null;
+let voiceReplyTimer = null;
+let audioContext = null;
+let analyser = null;
+let waveFrame = 0;
+let voiceLanguage = 'hi-IN';
+let gnaniTtsEnabled = false;
+let pendingLedgerRequest = (() => { try { return JSON.parse(sessionStorage.getItem(PENDING_ENTRY_KEY) || 'null'); } catch { return null; } })();
+let savingCustomer = false;
+let savingLedger = false;
+
+const money = (value) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(value) || 0);
+const dateKey = (value) => {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+};
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+const normaliseCustomerName = (value) => String(value ?? '').normalize('NFC').trim().toLocaleLowerCase('en-IN').replace(/\s+/g, ' ');
+function namesOneEditApart(left, right) {
+  const a = Array.from(normaliseCustomerName(left));
+  const b = Array.from(normaliseCustomerName(right));
+  if (Math.min(a.length, b.length) < 3 || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  let j = 0;
+  let differences = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i += 1; j += 1; continue; }
+    differences += 1;
+    if (differences > 1) return false;
+    if (a.length === b.length) { i += 1; j += 1; }
+    else if (a.length > b.length) i += 1;
+    else j += 1;
+  }
+  return differences + Number(i < a.length || j < b.length) <= 1;
+}
+
+function toast(message) {
+  const element = $('#toast');
+  element.textContent = message;
+  element.classList.add('show');
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => element.classList.remove('show'), 3200);
+}
+
+function speakText(message) {
+  if (gnaniTtsEnabled) return speakWithGnani(message).then((played) => played || speakWithBrowser(message));
+  return speakWithBrowser(message);
+}
+function speakWithBrowser(message) {
+  if (!('speechSynthesis' in window) || !window.SpeechSynthesisUtterance) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(message);
+    utterance.lang = voiceLanguage;
+    utterance.rate = 0.95;
+    utterance.volume = 1;
+    const voices = window.speechSynthesis.getVoices();
+    const language = voiceLanguage.toLowerCase().split('-')[0];
+    utterance.voice = voices.find((voice) => voice.lang.toLowerCase().startsWith(`${language}-`)) || null;
+    let finished = false;
+    const finish = (played) => {
+      if (finished) return;
+      finished = true;
+      resolve(played);
+    };
+    utterance.onend = () => finish(true);
+    utterance.onerror = () => finish(false);
+    try { window.speechSynthesis.speak(utterance); }
+    catch { finish(false); }
+  });
+}
+
+function setAuthError(message = '') {
+  const error = $('#auth-error');
+  error.textContent = message;
+  error.hidden = !message;
+}
+
+function showAuth(message = '') {
+  if (listening) stopListening();
+  stopVoiceReply();
+  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  $$('dialog[open]').forEach((dialog) => dialog.close());
+  pendingVoiceEntry = null;
+  $('#app-shell').hidden = true;
+  $('#auth-screen').hidden = false;
+  setAuthMode('login');
+  setAuthError(message);
+}
+
+function showApp() {
+  $('#auth-screen').hidden = true;
+  $('#app-shell').hidden = false;
+}
+
+async function api(path, options = {}) {
+  if (!API_BASE) throw new Error('API URL is missing. Set apiBaseUrl in frontend/config.js.');
+  const headers = new Headers(options.headers || {});
+  const hasBody = options.body !== undefined && options.body !== null;
+  if (token && !path.includes('/auth/login') && !path.includes('/auth/register')) headers.set('Authorization', `Bearer ${token}`);
+  if (hasBody && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, { ...options, headers, cache: 'no-store' });
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error('Cannot reach the backend. Start it with ./start.sh and open the app at http://127.0.0.1:8000.');
+    }
+    throw error;
+  }
+  const contentType = response.headers.get('content-type') || '';
+  const payload = contentType.includes('application/json') ? await response.json() : null;
+  if (!response.ok) {
+    const detail = payload?.detail;
+    const message = Array.isArray(detail) ? detail.map((item) => item.msg).join(', ') : (detail || `Request failed (${response.status})`);
+    if (response.status === 401 && !path.includes('/auth/login') && !path.includes('/auth/register')) {
+      token = '';
+      sessionStorage.removeItem(TOKEN_KEY);
+      showAuth('Your session expired. Please log in again.');
+    }
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+function decodeWavChunk(encoded) {
+  const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
+  if (bytes.length < 44) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const readId = (offset) => String.fromCharCode(...bytes.slice(offset, offset + 4));
+  if (readId(0) !== 'RIFF' || readId(8) !== 'WAVE') return null;
+  let format = null;
+  for (let offset = 12; offset + 8 <= bytes.length;) {
+    const id = readId(offset);
+    const size = view.getUint32(offset + 4, true);
+    const dataOffset = offset + 8;
+    if (dataOffset + size > bytes.length) return null;
+    if (id === 'fmt ' && size >= 16) {
+      format = {
+        code: view.getUint16(dataOffset, true),
+        channels: view.getUint16(dataOffset + 2, true),
+        sampleRate: view.getUint32(dataOffset + 4, true),
+        byteRate: view.getUint32(dataOffset + 8, true),
+        blockAlign: view.getUint16(dataOffset + 12, true),
+        bits: view.getUint16(dataOffset + 14, true),
+      };
+    } else if (id === 'data') {
+      return format ? { format, pcm: bytes.slice(dataOffset, dataOffset + size) } : null;
+    }
+    offset = dataOffset + size + (size % 2);
+  }
+  return null;
+}
+function assembleWav(chunks) {
+  const decoded = chunks.map(decodeWavChunk);
+  if (!decoded.length || decoded.some((chunk) => !chunk)) return null;
+  const format = decoded[0].format;
+  if (format.code !== 1 || decoded.some((chunk) => JSON.stringify(chunk.format) !== JSON.stringify(format))) return null;
+  const dataLength = decoded.reduce((total, chunk) => total + chunk.pcm.length, 0);
+  const output = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(output);
+  const putText = (offset, value) => [...value].forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0)));
+  putText(0, 'RIFF'); view.setUint32(4, 36 + dataLength, true); putText(8, 'WAVE');
+  putText(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, format.code, true);
+  view.setUint16(22, format.channels, true); view.setUint32(24, format.sampleRate, true);
+  view.setUint32(28, format.byteRate, true); view.setUint16(32, format.blockAlign, true); view.setUint16(34, format.bits, true);
+  putText(36, 'data'); view.setUint32(40, dataLength, true);
+  const outputBytes = new Uint8Array(output);
+  let cursor = 44;
+  for (const chunk of decoded) { outputBytes.set(chunk.pcm, cursor); cursor += chunk.pcm.length; }
+  return new Blob([output], { type: 'audio/wav' });
+}
+async function speakWithGnani(message) {
+  if (!token || !API_BASE) return false;
+  try {
+    const response = await fetch(`${API_BASE}/api/v1/voice/speak`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: message, language_code: voiceLanguage }),
+      cache: 'no-store',
+    });
+    if (!response.ok) return false;
+    const stream = await response.text();
+    const audioChunks = [];
+    for (const line of stream.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      try {
+        const event = JSON.parse(line.slice(5).trim());
+        if (event.audio) audioChunks.push(event.audio.replace(/^data:audio\/wav;base64,/i, ''));
+      } catch { /* Ignore SSE start/complete frames that do not contain JSON audio. */ }
+    }
+    const wav = assembleWav(audioChunks);
+    if (!wav) return false;
+    const url = URL.createObjectURL(wav);
+    try {
+      const audio = new Audio(url);
+      await new Promise((resolve, reject) => {
+        audio.onended = resolve;
+        audio.onerror = reject;
+        audio.play().catch(reject);
+      });
+    } finally { URL.revokeObjectURL(url); }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function setAuthMode(mode) {
+  const registering = mode === 'register';
+  $('#login-form').hidden = registering;
+  $('#register-form').hidden = !registering;
+  $('#auth-title').textContent = registering ? 'Set up your shop' : 'Welcome back';
+  $('#auth-subtitle').textContent = registering ? 'Set up your shop once. Later, sign in with your email and password.' : 'Sign in to see your customers and khata.';
+  $('#auth-toggle').textContent = registering ? 'Already have an account? Log in' : 'New here? Create an account';
+  setAuthError('');
+}
+
+async function authenticate(path, payload) {
+  try {
+    const result = await api(path, { method: 'POST', body: JSON.stringify(payload) });
+    token = result.access_token;
+    sessionStorage.setItem(TOKEN_KEY, token);
+    merchant = result.merchant;
+    await loadWorkspace();
+    showApp();
+    renderAll();
+    toast(path.endsWith('/register') ? 'Shop account created' : 'You are logged in');
+  } catch (error) {
+    setAuthError(error.message);
+  }
+}
+
+$('#login-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  authenticate('/api/v1/auth/login', {
+    email: $('#login-email').value.trim(),
+    password: $('#login-password').value,
+  });
+});
+$('#register-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  authenticate('/api/v1/auth/register', {
+    name: $('#register-name').value.trim(),
+    owner_name: $('#register-owner-name').value.trim() || null,
+    location: $('#register-location').value.trim() || null,
+    email: $('#register-email').value.trim(),
+    password: $('#register-password').value,
+  });
+});
+$('#auth-toggle').addEventListener('click', () => setAuthMode($('#register-form').hidden ? 'register' : 'login'));
+$('#logout-btn').addEventListener('click', () => {
+  token = '';
+  merchant = null;
+  customers = [];
+  transactions = [];
+  sessionStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(PENDING_ENTRY_KEY);
+  pendingLedgerRequest = null;
+  showAuth();
+  setAuthMode('login');
+});
+
+async function loadWorkspace() {
+  const [me, remoteCustomers, remoteEntries] = await Promise.all([
+    api('/api/v1/auth/me'),
+    api('/api/v1/customers'),
+    loadAllEntries(),
+  ]);
+  merchant = me;
+  transactions = remoteEntries.map((entry) => ({
+    id: entry.id,
+    customerId: entry.customer_id,
+    amount: Number(entry.amount),
+    type: entry.entry_type === 'udhaar' ? 'credit' : 'payment',
+    note: entry.note || '',
+    createdAt: entry.created_at,
+  }));
+  const activityByCustomer = new Map();
+  for (const entry of transactions) {
+    const current = activityByCustomer.get(entry.customerId);
+    if (!current || new Date(entry.createdAt) > new Date(current)) activityByCustomer.set(entry.customerId, entry.createdAt);
+  }
+  customers = remoteCustomers.map((customer) => ({
+    id: customer.id,
+    name: customer.name,
+    phone: customer.phone || '',
+    balance: Number(customer.balance),
+    lastActivity: activityByCustomer.get(customer.id) || null,
+  }));
+  profile = {
+    shopName: me.name,
+    ownerName: me.owner_name || '',
+    location: me.location || '',
+  };
+}
+
+async function loadAllEntries() {
+  const pageSize = 500;
+  const all = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await api(`/api/v1/ledger/entries?limit=${pageSize}&offset=${offset}`);
+    all.push(...page);
+    if (page.length < pageSize) return all;
+  }
+}
+
+function balanceOf(customerId) {
+  return Number(customers.find((customer) => customer.id === customerId)?.balance || 0);
+}
+function customerName(id) {
+  return customers.find((customer) => customer.id === id)?.name || 'Unknown customer';
+}
+function initials(name) {
+  return name.trim().split(/\s+/).slice(0, 2).map((word) => word[0] || '').join('').toUpperCase() || '·';
+}
+function displayTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (dateKey(date) === dateKey(new Date())) return date.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' });
+  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+}
+
+function renderProfile() {
+  const name = profile.shopName || 'Your shop';
+  $('#store-name').textContent = name;
+  $('#store-location').textContent = profile.location || merchant?.email || 'Shop account';
+  $('#store-avatar').textContent = initials(name);
+  $('#owner-name').textContent = profile.ownerName || 'Shop owner';
+  $('#owner-avatar').textContent = initials(profile.ownerName || 'Shop owner');
+  $('#greeting').textContent = profile.ownerName ? `Namaste, ${profile.ownerName} ji` : 'Your shop, at a glance';
+  $('#shop-name-input').value = name;
+  $('#owner-name-input').value = profile.ownerName || '';
+  $('#shop-location-input').value = profile.location || '';
+}
+function renderDate() {
+  const now = new Date();
+  $('#today-label').textContent = now.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).toUpperCase();
+  $('#today-date').textContent = now.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+function renderActivity() {
+  const list = $('#activity-list');
+  const items = [...transactions].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 5);
+  if (!items.length) {
+    list.innerHTML = '<div class="activity-empty"><span class="empty-mark">＋</span><b>Your ledger starts here</b><p>When you record a credit or payment, it will appear here.</p><button class="text-link" data-open-entry>Record your first entry →</button></div>';
+    list.querySelector('[data-open-entry]').addEventListener('click', () => openEntry());
+    return;
+  }
+  list.innerHTML = items.map((entry) => `<div class="activity-row"><span class="activity-symbol ${entry.type}">${entry.type === 'credit' ? '↗' : '↙'}</span><div class="activity-person"><b>${esc(customerName(entry.customerId))}</b><small>${esc(displayTime(entry.createdAt))} · ${entry.type === 'credit' ? 'Udhaar' : 'Payment'}${entry.note ? ` · ${esc(entry.note)}` : ''}</small></div><div class="activity-amount ${entry.type}">${entry.type === 'credit' ? '+' : '−'}${money(entry.amount)}<small>${entry.type === 'credit' ? 'Added' : 'Received'}</small></div></div>`).join('');
+}
+function renderHomeCustomers() {
+  const element = $('#home-customers');
+  const owing = customers.map((customer) => ({ ...customer, balance: balanceOf(customer.id) })).filter((customer) => customer.balance > 0).sort((a, b) => b.balance - a.balance).slice(0, 4);
+  if (!customers.length) {
+    element.innerHTML = '<div class="empty-state"><b>No customers yet</b><p>Add a customer to start keeping their khata.</p><button class="text-link" data-add-home-customer>＋ Add your first customer</button></div>';
+    element.querySelector('[data-add-home-customer]').addEventListener('click', openCustomer);
+    return;
+  }
+  element.innerHTML = owing.length ? owing.map((customer) => `<div class="customer-mini"><span class="customer-initial">${esc(initials(customer.name))}</span><span class="customer-mini-info"><b>${esc(customer.name)}</b><small>Outstanding</small></span><span class="customer-balance">${money(customer.balance)}</span></div>`).join('') : '<div class="empty-state"><b>All caught up</b><span>No customer has an outstanding balance.</span></div>';
+}
+function renderCustomers() {
+  const query = ($('#customer-search').value || '').trim().toLowerCase();
+  const filter = $('#balance-filter').value;
+  const rows = customers.map((customer) => ({ ...customer, balance: balanceOf(customer.id) }))
+    .filter((customer) => `${customer.name} ${customer.phone}`.toLowerCase().includes(query))
+    .filter((customer) => filter === 'owing' ? customer.balance > 0 : filter === 'settled' ? customer.balance === 0 : filter === 'advance' ? customer.balance < 0 : true)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  $('#customer-count').textContent = `${rows.length} ${rows.length === 1 ? 'customer' : 'customers'}`;
+  const body = $('#customer-rows');
+  if (!rows.length) {
+    body.innerHTML = customers.length ? '<tr><td colspan="6" class="table-empty">No customers match that search.</td></tr>' : '<tr><td colspan="6" class="table-empty">Your customer list is empty. Add a customer to start a khata.</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map((customer) => `<tr><td><span class="table-person"><span class="customer-initial">${esc(initials(customer.name))}</span>${esc(customer.name)}</span></td><td>${esc(customer.phone || '—')}</td><td>${esc(displayTime(customer.lastActivity))}</td><td><b>${money(Math.max(0, customer.balance))}</b>${customer.balance < 0 ? `<small class="advance-note"> · Advance ${money(-customer.balance)}</small>` : ''}</td><td><span class="status-badge ${customer.balance <= 0 ? 'settled' : ''}">${customer.balance > 0 ? 'Outstanding' : customer.balance < 0 ? 'Advance' : 'Settled'}</span></td><td></td></tr>`).join('');
+}
+function renderTransactions() {
+  const body = $('#transaction-rows');
+  const items = [...transactions].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  if (!items.length) {
+    body.innerHTML = '<tr><td colspan="5" class="table-empty">Transactions you record will appear here.</td></tr>';
+    return;
+  }
+  body.innerHTML = items.map((entry) => `<tr><td>${esc(new Date(entry.createdAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }))}</td><td>${esc(customerName(entry.customerId))}</td><td>${esc(entry.note || '—')}</td><td><span class="status-badge ${entry.type === 'payment' ? 'settled' : ''}">${entry.type === 'credit' ? 'Udhaar' : 'Payment'}</span></td><td><b>${entry.type === 'credit' ? '+' : '−'}${money(entry.amount)}</b></td></tr>`).join('');
+}
+function sums(items, type) {
+  return items.filter((entry) => !type || entry.type === type).reduce((sum, entry) => sum + Number(entry.amount), 0);
+}
+function renderSummary() {
+  const today = dateKey(new Date());
+  const month = today.slice(0, 7);
+  const todayItems = transactions.filter((entry) => dateKey(entry.createdAt) === today);
+  const monthItems = transactions.filter((entry) => dateKey(entry.createdAt).slice(0, 7) === month);
+  const balances = customers.map((customer) => balanceOf(customer.id));
+  $('#total-outstanding').textContent = money(balances.reduce((sum, balance) => sum + Math.max(0, balance), 0));
+  const owing = balances.filter((balance) => balance > 0).length;
+  $('#outstanding-count').textContent = `${owing} ${owing === 1 ? 'customer' : 'customers'} with balance`;
+  $('#today-collected').textContent = money(sums(todayItems, 'payment'));
+  $('#today-count').textContent = String(todayItems.length);
+  $('#month-credit').textContent = money(sums(monthItems, 'credit'));
+  $('#month-payments').textContent = money(sums(monthItems, 'payment'));
+  $('#analytics-customer-count').textContent = String(owing);
+  renderWeeklyChart();
+}
+function renderWeeklyChart() {
+  const root = $('#weekly-chart');
+  const days = [];
+  for (let offset = 6; offset >= 0; offset -= 1) {
+    const day = new Date();
+    day.setHours(0, 0, 0, 0);
+    day.setDate(day.getDate() - offset);
+    const key = dateKey(day);
+    const entries = transactions.filter((entry) => dateKey(entry.createdAt) === key);
+    days.push({ label: day.toLocaleDateString('en-IN', { weekday: 'short' }), credit: sums(entries, 'credit'), payment: sums(entries, 'payment') });
+  }
+  const max = Math.max(1, ...days.flatMap((day) => [day.credit, day.payment]));
+  root.innerHTML = days.map((day) => `<div class="week-day" title="${esc(day.label)} · Credit ${money(day.credit)} · Payment ${money(day.payment)}"><div class="week-bars"><span class="week-credit" style="height:${Math.max(day.credit ? 5 : 0, day.credit / max * 100)}%"></span><span class="week-payment" style="height:${Math.max(day.payment ? 5 : 0, day.payment / max * 100)}%"></span></div><small>${esc(day.label)}</small></div>`).join('');
+}
+function renderAll() {
+  renderProfile();
+  renderDate();
+  renderActivity();
+  renderHomeCustomers();
+  renderCustomers();
+  renderTransactions();
+  renderSummary();
+}
+function go(page) {
+  $$('.page').forEach((element) => element.classList.toggle('active', element.id === `page-${page}`));
+  $$('[data-page]').forEach((button) => button.classList.toggle('active', button.dataset.page === page));
+  $('#crumb-page').textContent = page === 'khata' ? 'Digital khata' : page === 'analytics' ? 'Analytics' : 'Overview';
+  if (page === 'khata') renderCustomers();
+  if (page === 'analytics') renderSummary();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+$$('[data-page]').forEach((button) => button.addEventListener('click', () => go(button.dataset.page)));
+$$('[data-goto]').forEach((button) => button.addEventListener('click', () => go(button.dataset.goto)));
+$$('[data-open-entry]').forEach((button) => button.addEventListener('click', () => openEntry()));
+
+function openCustomer() {
+  $('#customer-dialog').showModal();
+  $('#new-name').focus();
+}
+let openEntryAfterCustomer = false;
+let manualEntryAfterCustomer = null;
+function openEntry(selectedCustomerId = '', draft = null) {
+  if (!customers.length) {
+    openEntryAfterCustomer = true;
+    manualEntryAfterCustomer = draft;
+    openCustomer();
+    toast('Add a customer first, then record their entry.');
+    return;
+  }
+  $('#transaction-form').reset();
+  populateCustomerSelect(selectedCustomerId);
+  if (draft) {
+    if (!draft.customerId || draft.ambiguousCustomerIds?.length > 1) $('#transaction-customer').value = '';
+    $('#transaction-type').value = draft.type === 'payment' ? 'payment' : 'credit';
+    $('#transaction-amount').value = String(draft.amount);
+    $('#transaction-note').value = draft.raw || '';
+  }
+  $('#transaction-dialog').showModal();
+  $('#transaction-customer').focus();
+}
+function populateCustomerSelect(selectedId = '') {
+  const select = $('#transaction-customer');
+  const ordered = customers.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const nameCounts = new Map();
+  for (const customer of ordered) {
+    const key = normaliseCustomerName(customer.name);
+    nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+  }
+  const options = ordered.map((customer) => {
+    const duplicate = nameCounts.get(normaliseCustomerName(customer.name)) > 1;
+    const identity = duplicate ? (customer.phone ? ` · ${customer.phone}` : ` · account ${customer.id.slice(-4)}`) : '';
+    return `<option value="${esc(customer.id)}">${esc(customer.name)}${identity} · balance ${money(balanceOf(customer.id))}</option>`;
+  }).join('');
+  select.innerHTML = `<option value="" disabled>Choose a customer</option>${options}`;
+  select.value = selectedId || (ordered.length === 1 ? ordered[0].id : '');
+}
+$('#shop-profile').addEventListener('click', () => $('#profile-dialog').showModal());
+$('#profile-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    merchant = await api('/api/v1/auth/me', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        name: $('#shop-name-input').value.trim(),
+        owner_name: $('#owner-name-input').value.trim() || null,
+        location: $('#shop-location-input').value.trim() || null,
+      }),
+    });
+    profile = { shopName: merchant.name, ownerName: merchant.owner_name || '', location: merchant.location || '' };
+    renderAll();
+    $('#profile-dialog').close();
+    toast('Shop details saved to your account');
+  } catch (error) {
+    toast(error.message);
+  }
+});
+$('#add-customer').addEventListener('click', openCustomer);
+function clearPendingCustomerEntry() {
+  openEntryAfterCustomer = false;
+  manualEntryAfterCustomer = null;
+}
+$('#customer-dialog .dialog-close').addEventListener('click', clearPendingCustomerEntry);
+$('#customer-dialog').addEventListener('cancel', clearPendingCustomerEntry);
+$('#customer-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (savingCustomer) return;
+  savingCustomer = true;
+  const submitButton = event.target.querySelector('[type="submit"]');
+  submitButton.disabled = true;
+  const name = $('#new-name').value.trim();
+  const phone = $('#new-phone').value.trim();
+  try {
+    const created = await api('/api/v1/customers', { method: 'POST', body: JSON.stringify({ name, phone: phone || null }) });
+    await loadWorkspace();
+    renderAll();
+    $('#customer-dialog').close();
+    event.target.reset();
+    toast(`${name} added to your khata`);
+    if (openEntryAfterCustomer) {
+      openEntryAfterCustomer = false;
+      const correction = manualEntryAfterCustomer;
+      manualEntryAfterCustomer = null;
+      openEntry(created.id, correction);
+    }
+  } catch (error) {
+    if (error.status === 409 && error.message.toLowerCase().includes('customer with this name already exists')) {
+      try {
+        await loadWorkspace();
+        renderAll();
+        const matches = customers.filter((customer) => normaliseCustomerName(customer.name) === normaliseCustomerName(name));
+        if (matches.length) {
+          $('#customer-dialog').close();
+          event.target.reset();
+          openEntryAfterCustomer = false;
+          const correction = manualEntryAfterCustomer;
+          manualEntryAfterCustomer = null;
+          if (matches.length === 1) {
+            openEntry(matches[0].id, correction);
+            toast(`${matches[0].name} is already in your khata. Choose udhaar or payment for them; use a distinguishing name for a different person.`);
+          } else {
+            openEntry('', correction);
+            toast(`More than one ${name} is in your khata. Choose the correct account by phone or account number.`);
+          }
+          return;
+        }
+      } catch (refreshError) {
+        toast(`Customer already exists. Could not refresh your list: ${refreshError.message}`);
+        return;
+      }
+    }
+    toast(error.message);
+  } finally {
+    savingCustomer = false;
+    submitButton.disabled = false;
+  }
+});
+$('#add-transaction').addEventListener('click', () => openEntry());
+$('#transaction-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (savingLedger) return;
+  const customerId = $('#transaction-customer').value;
+  const amount = Number($('#transaction-amount').value);
+  const type = $('#transaction-type').value;
+  const note = $('#transaction-note').value.trim();
+  if (!customerId || !Number.isFinite(amount) || amount <= 0) {
+    toast('Choose a customer and enter an amount greater than zero.');
+    return;
+  }
+  savingLedger = true;
+  const submitButton = event.target.querySelector('[type="submit"]');
+  submitButton.disabled = true;
+  try {
+    await createLedgerEntry(customerId, amount, type, note);
+    $('#transaction-dialog').close();
+    event.target.reset();
+    toast('Entry saved to your khata');
+    const spokenType = type === 'credit' ? 'उधार की एंट्री' : 'जमा की एंट्री';
+    speakText(`${customerName(customerId)}, ${amount} रुपये की ${spokenType} सेव हो गई।`);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    savingLedger = false;
+    submitButton.disabled = false;
+  }
+});
+async function createLedgerEntry(customerId, amount, type, note = '') {
+  const payload = { customer_id: customerId, amount, entry_type: type === 'credit' ? 'udhaar' : 'jama', note: note || null };
+  const signature = JSON.stringify(payload);
+  if (!pendingLedgerRequest || pendingLedgerRequest.signature !== signature) {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    const key = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    pendingLedgerRequest = { signature, key };
+    sessionStorage.setItem(PENDING_ENTRY_KEY, JSON.stringify(pendingLedgerRequest));
+  }
+  await api('/api/v1/ledger/entries', {
+    method: 'POST',
+    headers: { 'Idempotency-Key': pendingLedgerRequest.key },
+    body: JSON.stringify(payload),
+  });
+  await loadWorkspace();
+  renderAll();
+  pendingLedgerRequest = null;
+  sessionStorage.removeItem(PENDING_ENTRY_KEY);
+}
+$('#help-btn').addEventListener('click', () => toast('Your customer and ledger data sync with the VoiceKhata backend.'));
+$('#customer-search').addEventListener('input', renderCustomers);
+$('#balance-filter').addEventListener('change', renderCustomers);
+$('#voice-language').addEventListener('click', () => {
+  voiceLanguage = voiceLanguage === 'hi-IN' ? 'en-IN' : 'hi-IN';
+  $('#voice-language').textContent = voiceLanguage === 'hi-IN' ? 'HI' : 'EN';
+  toast(`Voice recognition language: ${voiceLanguage === 'hi-IN' ? 'Hindi' : 'English'}`);
+});
+
+const NUMBER_WORDS = { zero:0, one:1, ek:1, 'एक':1, two:2, do:2, 'दो':2, three:3, teen:3, 'तीन':3, four:4, char:4, chaar:4, 'चार':4, five:5, paanch:5, panch:5, 'पांच':5, 'पाँच':5, six:6, chhe:6, 'छह':6, seven:7, saat:7, 'सात':7, eight:8, aath:8, 'आठ':8, nine:9, nau:9, 'नौ':9, ten:10, das:10, 'दस':10, eleven:11, gyarah:11, 'ग्यारह':11, twelve:12, barah:12, 'बारह':12, thirteen:13, terah:13, 'तेरह':13, fourteen:14, chaudah:14, 'चौदह':14, fifteen:15, pandrah:15, 'पंद्रह':15, sixteen:16, solah:16, 'सोलह':16, seventeen:17, satrah:17, 'सत्रह':17, eighteen:18, atharah:18, 'अठारह':18, nineteen:19, unnis:19, 'उन्नीस':19, twenty:20, bees:20, 'बीस':20, thirty:30, tees:30, 'तीस':30, forty:40, chalis:40, 'चालीस':40, fifty:50, pachaas:50, 'पचास':50, sixty:60, saath:60, 'साठ':60, seventy:70, sattar:70, 'सत्तर':70, eighty:80, assi:80, 'अस्सी':80, ninety:90, nabbe:90, 'नब्बे':90, hundred:100, sau:100, 'सौ':100, thousand:1000, hazaar:1000, 'हजार':1000, lakh:100000, lac:100000 };
+function normaliseDigits(value) {
+  return value.replace(/[०-९]/g, (digit) => String('०१२३४५६७८९'.indexOf(digit)));
+}
+function spokenAmount(text) {
+  // Hindi vowel marks are Unicode combining marks, so include them in each word.
+  const tokens = [...text.matchAll(/[\p{L}\p{M}]+/gu)];
+  let best = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    if (!(tokens[i][0].toLowerCase() in NUMBER_WORDS)) continue;
+    let total = 0;
+    let current = 0;
+    let last = i;
+    for (let j = i; j < tokens.length; j += 1) {
+      const key = tokens[j][0].toLowerCase();
+      if (!(key in NUMBER_WORDS)) break;
+      last = j;
+      const value = NUMBER_WORDS[key];
+      if (value === 100) current = Math.max(1, current) * 100;
+      else if (value >= 1000) { total += Math.max(1, current) * value; current = 0; }
+      else current += value;
+    }
+    const value = total + current;
+    if (value > 0 && (!best || last - i > best.tokenEnd - best.tokenStart)) {
+      best = {
+        charStart: tokens[i].index,
+        charEnd: tokens[last].index + tokens[last][0].length,
+        tokenStart: i,
+        tokenEnd: last,
+        value,
+      };
+    }
+  }
+  return best;
+}
+function parseCommand(raw) {
+  const text = normaliseDigits(raw.trim());
+  if (!text) return null;
+  const numeric = text.match(/(?:₹\s*)?(\d[\d,]*(?:\.\d{1,2})?)/);
+  let amount;
+  let amountSpan;
+  if (numeric) {
+    amount = Number(numeric[1].replace(/,/g, ''));
+    amountSpan = [numeric.index, numeric.index + numeric[0].length];
+  } else {
+    const word = spokenAmount(text);
+    if (!word) return { error: 'I couldn’t find an amount. Please say it clearly and try again.' };
+    amount = word.value;
+    amountSpan = [word.charStart, word.charEnd];
+  }
+  if (!Number.isFinite(amount) || amount <= 0) return { error: 'Please give an amount greater than zero.' };
+  let customerText = `${text.slice(0, amountSpan[0])} ${text.slice(amountSpan[1])}`;
+  customerText = customerText.replace(/\b(?:rupaye|rupees|rs\.?|ka|ke|ko|se|ne|par|udhaar|udhar|credit|debit|jama|mile|mila|likho|likh|entry|received|payment|paid|vasool|add|record|aaj|today|hai|hain|tha|the)\b/giu, ' ');
+  customerText = customerText.replace(/(?:रुपये|रुपए|रुपया|लिखो|लिख|जमा|उधार|उधर|उधारी|मिले|मिला|आज|है|थे|था|का|के|को)/gu, ' ').replace(/₹/g, ' ').replace(/[.,!?]/g, ' ').trim().replace(/\s+/g, ' ');
+  const isPayment = /(jama|mil[eai]|paid|payment|received|vasool|जमा|मिले|मिला)/iu.test(text);
+  const normalized = normaliseCustomerName(customerText);
+  const matches = customers.filter((customer) => normalized === normaliseCustomerName(customer.name));
+  const suggestions = matches.length ? [] : customers.filter((customer) => namesOneEditApart(normalized, customer.name));
+  let name = matches[0]?.name;
+  if (!name) name = customerText.split(' ').filter(Boolean).slice(0, 3).join(' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  if (!name) return { error: 'Say the customer’s name and the amount.' };
+  return {
+    customer: name,
+    customerId: matches.length === 1 ? matches[0].id : null,
+    ambiguousCustomerIds: matches.length > 1 ? matches.map((customer) => customer.id) : [],
+    suggestedCustomerIds: suggestions.map((customer) => customer.id),
+    amount,
+    type: isPayment ? 'payment' : 'credit',
+    raw: raw.trim(),
+  };
+}
+function showVoiceConfirmation(entry) {
+  const existing = customers.find((customer) => customer.id === entry.customerId);
+  const ambiguous = entry.ambiguousCustomerIds?.length > 1;
+  const suggestions = !existing && !ambiguous
+    ? customers.filter((customer) => (entry.suggestedCustomerIds || []).includes(customer.id))
+    : [];
+  const needsChoice = ambiguous || suggestions.length > 0;
+  const choiceLabel = $('#voice-customer-choice-wrap');
+  const choice = $('#voice-customer-choice');
+  choiceLabel.hidden = !needsChoice;
+  choice.required = needsChoice;
+  if (ambiguous) {
+    const matches = customers.filter((customer) => entry.ambiguousCustomerIds.includes(customer.id));
+    choice.innerHTML = `<option value="">Choose the right account</option>${matches.map((customer) => `<option value="${esc(customer.id)}">${esc(customer.name)}${customer.phone ? ` · ${esc(customer.phone)}` : ` · account ${esc(customer.id.slice(-4))}`} · balance ${money(balanceOf(customer.id))}</option>`).join('')}`;
+    choice.value = '';
+    $('#confirm-title').textContent = 'Which customer is this?';
+    $('#confirm-copy').textContent = `I found more than one ${entry.customer}. Choose the right account, then confirm ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar' : 'a payment'}.`;
+  } else if (suggestions.length) {
+    choice.innerHTML = `<option value="">Choose the correct name</option><option value="new">New customer: ${esc(entry.customer)}</option>${suggestions.map((customer) => `<option value="${esc(customer.id)}">Existing: ${esc(customer.name)}${customer.phone ? ` · ${esc(customer.phone)}` : ` · account ${esc(customer.id.slice(-4))}`} · balance ${money(balanceOf(customer.id))}</option>`).join('')}`;
+    choice.value = '';
+    $('#confirm-title').textContent = 'Check the customer name';
+    $('#confirm-copy').textContent = `I heard “${entry.customer}”, which is close to an existing name. Choose the right account or select New customer. Then confirm ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar' : 'a payment'}.`;
+  } else {
+    choice.innerHTML = '';
+    choice.required = false;
+    $('#confirm-title').textContent = existing ? 'Add this to the existing khata?' : 'Create a new khata?';
+    $('#confirm-copy').textContent = existing
+      ? `Add ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar for' : 'payment from'} ${existing.name}?`
+      : `I heard “${entry.customer}”. Check the name carefully before saving ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar' : 'a payment'}. If it is wrong or an existing customer, choose “Let me fix it”.`;
+  }
+  $('#confirm-dialog').showModal();
+}
+function openManualCorrection(entry) {
+  if (!entry.customerId && !entry.ambiguousCustomerIds?.length && entry.type === 'credit') {
+    openEntryAfterCustomer = true;
+    manualEntryAfterCustomer = entry;
+    $('#customer-form').reset();
+    $('#new-name').value = entry.customer;
+    openCustomer();
+    toast('Check the customer name. After adding them, you can correct the amount and entry type.');
+    return;
+  }
+  if (!customers.length) {
+    openEntryAfterCustomer = true;
+    manualEntryAfterCustomer = entry;
+    $('#customer-form').reset();
+    $('#new-name').value = entry.customer || '';
+    openCustomer();
+    toast('Add the customer first. The entry details will be ready to review next.');
+    return;
+  }
+  openEntryAfterCustomer = false;
+  manualEntryAfterCustomer = null;
+  openEntry(entry.customerId || '', entry);
+}
+function cancelVoiceSession(sessionId) {
+  if (sessionId) api(`/api/v1/voice/sessions/${sessionId}/cancel`, { method: 'POST' }).catch(() => {});
+}
+function prepareVoiceEntry(raw, sessionId = null) {
+  const parsed = parseCommand(raw);
+  if (!parsed) { cancelVoiceSession(sessionId); return; }
+  if (parsed.error) { cancelVoiceSession(sessionId); toast(parsed.error); speakText(parsed.error); return; }
+  parsed.sessionId = sessionId;
+  pendingVoiceEntry = parsed;
+  beginVoiceConfirmation(parsed);
+}
+function voiceConfirmationPrompt(entry) {
+  const amount = Number(entry.amount).toLocaleString(voiceLanguage === 'hi-IN' ? 'hi-IN' : 'en-IN');
+  const relation = entry.type === 'credit' ? 'उधार' : 'जमा';
+  const englishRelation = entry.type === 'credit' ? 'credit' : 'payment';
+  const existing = customers.find((customer) => customer.id === entry.customerId);
+  const choices = entry.ambiguousCustomerIds?.length
+    ? customers.filter((customer) => entry.ambiguousCustomerIds.includes(customer.id))
+    : (entry.suggestedCustomerIds || []).length
+      ? customers.filter((customer) => entry.suggestedCustomerIds.includes(customer.id))
+      : [];
+  const choiceLabels = choices.map((customer) => customer.phone
+    ? `${customer.name}, phone ending ${customer.phone.replace(/\D/g, '').slice(-4)}`
+    : customer.name);
+  if (voiceLanguage !== 'hi-IN') {
+    if (choices.length) return `I heard ${entry.customer}. Similar accounts: ${choiceLabels.join('; ')}. Say the correct name or phone ending${entry.suggestedCustomerIds?.length ? ', say new for a new customer' : ''}, or say cancel.`;
+    return existing
+      ? `${existing.name}, ${amount} rupees ${englishRelation}. Say yes to save, or no to cancel.`
+      : `I heard ${entry.customer}. Create this customer and record ${amount} rupees as a ${englishRelation}? Say yes to save, or no to cancel.`;
+  }
+  if (choices.length) return `मैंने ${entry.customer} सुना। मिलते-जुलते खाते हैं: ${choiceLabels.join('; ')}। सही ग्राहक का नाम या फोन के आखिरी चार अंक बोलें${entry.suggestedCustomerIds?.length ? ', नया ग्राहक बनाने के लिए नया बोलें' : ''}, या रद्द करने के लिए नहीं बोलें।`;
+  return existing
+    ? `${existing.name}, ${amount} रुपये ${relation}। सही है तो हाँ बोलें। रद्द करने के लिए नहीं बोलें।`
+    : `${entry.customer}, ${amount} रुपये ${relation}। नया खाता बनाकर सेव करने के लिए हाँ बोलें। रद्द करने के लिए नहीं बोलें।`;
+}
+function beginVoiceConfirmation(entry) {
+  pendingVoiceEntry = entry;
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition || (!('speechSynthesis' in window) && !gnaniTtsEnabled)) {
+    showVoiceConfirmation(entry);
+    toast('Hands-free confirmation is not available in this browser.');
+    return;
+  }
+  awaitingVoiceReply = true;
+  $('#voice-title').textContent = 'Please confirm by voice';
+  $('#voice-subtitle').textContent = 'Listen to the summary, then say haan or nahi.';
+  $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Speaking your entry details…</span>';
+  speakText(voiceConfirmationPrompt(entry)).then((played) => {
+    if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
+    if (!played) { showVoiceReplyFallback(entry, 'Could not play the voice summary.'); return; }
+    listenForVoiceConfirmation(entry, SpeechRecognition, 0);
+  });
+}
+function stopVoiceReply() {
+  awaitingVoiceReply = false;
+  if (voiceReplyTimer) { clearTimeout(voiceReplyTimer); voiceReplyTimer = null; }
+  const active = voiceReplyRecognition;
+  voiceReplyRecognition = null;
+  if (active) { active.onresult = null; active.onerror = null; active.onend = null; try { active.abort(); } catch {} }
+}
+function showVoiceReplyFallback(entry, message) {
+  if (!awaitingVoiceReply) return;
+  stopVoiceReply();
+  showVoiceConfirmation(entry);
+  if (message) toast(`${message} Use the confirmation controls on screen.`);
+}
+function listenForVoiceConfirmation(entry, SpeechRecognition, attempt) {
+  if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
+  let reply;
+  try {
+    reply = new SpeechRecognition();
+    reply.lang = voiceLanguage;
+    reply.interimResults = false;
+    reply.continuous = false;
+    voiceReplyRecognition = reply;
+    $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Listening for your answer…</span>';
+    reply.onresult = (event) => {
+      const heard = Array.from(event.results).map((result) => result[0].transcript).join(' ').trim();
+      stopVoiceReply();
+      handleVoiceConfirmationReply(entry, heard, SpeechRecognition, attempt);
+    };
+    reply.onerror = (event) => {
+      if (awaitingVoiceReply) showVoiceReplyFallback(entry, event.error === 'not-allowed' ? 'Allow microphone access to confirm by voice.' : 'I could not hear your answer.');
+    };
+    reply.onend = () => {
+      if (awaitingVoiceReply) showVoiceReplyFallback(entry, 'I did not hear an answer.');
+    };
+    voiceReplyTimer = setTimeout(() => showVoiceReplyFallback(entry, 'I did not hear an answer.'), 10000);
+    reply.start();
+  } catch {
+    showVoiceReplyFallback(entry, 'Voice confirmation could not start.');
+  }
+}
+function voiceReplyChoice(entry, heard) {
+  const text = normaliseCustomerName(heard);
+  const candidates = entry.ambiguousCustomerIds?.length
+    ? customers.filter((customer) => entry.ambiguousCustomerIds.includes(customer.id))
+    : customers.filter((customer) => (entry.suggestedCustomerIds || []).includes(customer.id));
+  const digits = text.replace(/\D/g, '');
+  const byName = candidates.filter((customer) => text.includes(normaliseCustomerName(customer.name)));
+  if (byName.length === 1) return byName[0];
+  if (digits.length >= 2) {
+    const byPhone = candidates.filter((customer) => customer.phone && customer.phone.replace(/\D/g, '').endsWith(digits));
+    if (byPhone.length === 1) return byPhone[0];
+  }
+  return null;
+}
+function handleVoiceConfirmationReply(entry, heard, SpeechRecognition, attempt) {
+  if (pendingVoiceEntry !== entry) return;
+  const words = [...heard.normalize('NFC').toLocaleLowerCase('en-IN').matchAll(/[\p{L}\p{M}]+/gu)].map((match) => match[0]);
+  const noWords = new Set(['no', 'nahi', 'nahin', 'नहीं', 'नही', 'रद्द', 'cancel', 'stop']);
+  const yesWords = new Set(['yes', 'yeah', 'haan', 'han', 'हाँ', 'हां', 'हा', 'जी', 'सही', 'ठीक', 'save', 'confirm']);
+  if (words.some((word) => noWords.has(word))) {
+    pendingVoiceEntry = null;
+    cancelVoiceSession(entry.sessionId);
+    setVoiceReady('Entry cancelled. Nothing was saved.');
+    speakText(voiceLanguage === 'hi-IN' ? 'ठीक है, एंट्री रद्द कर दी। कुछ सेव नहीं हुआ।' : 'Okay, the entry is cancelled. Nothing was saved.');
+    return;
+  }
+  const hasChoices = entry.ambiguousCustomerIds?.length || entry.suggestedCustomerIds?.length;
+  if (hasChoices) {
+    const customer = voiceReplyChoice(entry, heard);
+    if (customer) {
+      entry.customerId = customer.id;
+      entry.customer = customer.name;
+      entry.ambiguousCustomerIds = [];
+      entry.suggestedCustomerIds = [];
+      pendingVoiceEntry = entry;
+      $('#voice-customer-choice').value = customer.id;
+      $('#confirm-transaction').click();
+      return;
+    }
+    if (words.some((word) => ['new', 'naya', 'नया', 'नयी', 'नए'].includes(word)) && entry.suggestedCustomerIds?.length) {
+      entry.ambiguousCustomerIds = [];
+      entry.suggestedCustomerIds = [];
+      pendingVoiceEntry = entry;
+      $('#confirm-transaction').click();
+      return;
+    }
+  } else if (words.some((word) => yesWords.has(word))) {
+    $('#confirm-transaction').click();
+    return;
+  }
+  if (attempt < 1) {
+    const retryPrompt = hasChoices
+      ? `${voiceLanguage === 'hi-IN' ? 'माफ कीजिए, समझ नहीं आया। ' : 'Sorry, I did not understand. '}${voiceConfirmationPrompt(entry)}`
+      : (voiceLanguage === 'hi-IN' ? 'माफ कीजिए, समझ नहीं आया। सेव करने के लिए हाँ, रद्द करने के लिए नहीं बोलें।' : 'Sorry, I did not understand. Say yes to save or no to cancel.');
+    speakText(retryPrompt).then((played) => {
+      if (played && pendingVoiceEntry === entry) listenForVoiceConfirmation(entry, SpeechRecognition, attempt + 1);
+      else if (pendingVoiceEntry === entry) showVoiceReplyFallback(entry, 'I could not understand your answer.');
+    });
+    return;
+  }
+  pendingVoiceEntry = entry;
+  showVoiceConfirmation(entry);
+  toast('I could not understand the voice reply. Please confirm on screen.');
+}
+function dismissVoiceConfirmation() {
+  const sessionId = pendingVoiceEntry?.sessionId;
+  stopVoiceReply();
+  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  pendingVoiceEntry = null;
+  cancelVoiceSession(sessionId);
+  setVoiceReady();
+}
+$('#cancel-transaction').addEventListener('click', () => {
+  const entry = pendingVoiceEntry;
+  dismissVoiceConfirmation();
+  if ($('#confirm-dialog').open) $('#confirm-dialog').close();
+  if (entry) openManualCorrection(entry);
+});
+$('#confirm-dialog .dialog-close').addEventListener('click', dismissVoiceConfirmation);
+$('#confirm-dialog').addEventListener('cancel', dismissVoiceConfirmation);
+$('#confirm-dialog').addEventListener('close', () => {
+  // The title-bar close button submits its method="dialog" form without firing
+  // the cancel event. Still cancel a server-side voice session when dismissed.
+  if (pendingVoiceEntry) dismissVoiceConfirmation();
+});
+let confirmingVoiceEntry = false;
+$('#confirm-transaction').addEventListener('click', async () => {
+  if (!pendingVoiceEntry || confirmingVoiceEntry) return;
+  confirmingVoiceEntry = true;
+  const confirmButton = $('#confirm-transaction');
+  confirmButton.disabled = true;
+  const entry = pendingVoiceEntry;
+  pendingVoiceEntry = null;
+  if ($('#confirm-dialog').open) $('#confirm-dialog').close();
+  try {
+    let customerId = entry.customerId;
+    if (entry.ambiguousCustomerIds?.length > 1) {
+      customerId = $('#voice-customer-choice').value;
+      if (!customerId) {
+        toast('Choose which customer should get this entry.');
+        pendingVoiceEntry = entry;
+        showVoiceConfirmation(entry);
+        return;
+      }
+    } else if (entry.suggestedCustomerIds?.length) {
+      const selected = $('#voice-customer-choice').value;
+      if (!selected) {
+        toast('Choose the correct existing name, or select New customer.');
+        pendingVoiceEntry = entry;
+        showVoiceConfirmation(entry);
+        return;
+      }
+      customerId = selected === 'new' ? null : selected;
+    }
+    if (!customerId) {
+      const created = await api('/api/v1/customers', { method: 'POST', body: JSON.stringify({ name: entry.customer, phone: null }) });
+      customerId = created.id;
+    }
+    const payload = {
+      customer_id: customerId,
+      amount: entry.amount,
+      entry_type: entry.type === 'credit' ? 'udhaar' : 'jama',
+      note: entry.raw || null,
+    };
+    if (entry.sessionId) {
+      await api(`/api/v1/voice/sessions/${entry.sessionId}/confirm`, { method: 'POST', body: JSON.stringify(payload) });
+      await loadWorkspace();
+      renderAll();
+    } else {
+      await createLedgerEntry(customerId, entry.amount, entry.type, entry.raw);
+    }
+    setVoiceReady('Entry saved. Your khata is up to date.');
+    toast('Confirmed entry saved to your khata');
+    const savedCustomerName = customerName(customerId);
+    const savedType = entry.type === 'credit' ? 'उधार की एंट्री' : 'जमा की एंट्री';
+    speakText(`${savedCustomerName}, ${Number(entry.amount).toLocaleString('hi-IN')} रुपये की ${savedType} सेव हो गई।`);
+  } catch (error) {
+    if (entry.sessionId && error.status === 409) {
+      try {
+        await loadWorkspace();
+        renderAll();
+        toast('This voice entry was already handled. Your ledger has been refreshed.');
+        return;
+      } catch {}
+    }
+    if (!entry.customerId && !entry.ambiguousCustomerIds?.length && error.status === 409 && error.message.toLowerCase().includes('customer with this name already exists')) {
+      try {
+        await loadWorkspace();
+        renderAll();
+        const matches = customers.filter((customer) => normaliseCustomerName(customer.name) === normaliseCustomerName(entry.customer));
+        if (matches.length) {
+          pendingVoiceEntry = matches.length === 1
+            ? { ...entry, customer: matches[0].name, customerId: matches[0].id, ambiguousCustomerIds: [], suggestedCustomerIds: [] }
+            : { ...entry, customer: matches[0].name, customerId: null, ambiguousCustomerIds: matches.map((customer) => customer.id), suggestedCustomerIds: [] };
+          showVoiceConfirmation(pendingVoiceEntry);
+          toast(matches.length === 1
+            ? `${matches[0].name} already exists. Confirm again to add this entry to that account.`
+            : `More than one ${matches[0].name} exists. Choose the correct account, then confirm.`);
+          return;
+        }
+      } catch (refreshError) {
+        toast(`Customer already exists, but the list could not refresh: ${refreshError.message}`);
+        return;
+      }
+    }
+    if (entry.sessionId && !pendingVoiceEntry) {
+      // Keep the explicit confirmation available after a transient failure.
+      // The backend binds a voice session to at most one ledger entry, so a
+      // retry cannot create a second entry if the first response was lost.
+      pendingVoiceEntry = entry;
+      showVoiceConfirmation(entry);
+      toast('Could not confirm the save. Check your connection, then try again.');
+      return;
+    }
+    toast(error.message);
+  } finally {
+    confirmingVoiceEntry = false;
+    confirmButton.disabled = false;
+  }
+});
+
+const waveCanvas = $('.wave-canvas');
+const waveCtx = waveCanvas.getContext('2d');
+function drawWave(time = 0) {
+  const box = waveCanvas.getBoundingClientRect();
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const width = Math.max(1, box.width);
+  const height = Math.max(1, box.height);
+  if (waveCanvas.width !== Math.round(width * dpr) || waveCanvas.height !== Math.round(height * dpr)) {
+    waveCanvas.width = Math.round(width * dpr);
+    waveCanvas.height = Math.round(height * dpr);
+  }
+  waveCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  waveCtx.clearRect(0, 0, width, height);
+  let level = 0;
+  if (analyser) {
+    const data = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (const sample of data) { const value = (sample - 128) / 128; sum += value * value; }
+    level = Math.min(1, Math.sqrt(sum / data.length) * 5);
+  }
+  const active = listening;
+  const center = height / 2;
+  const phase = active ? time * 0.0012 : 0;
+  const gradient = waveCtx.createLinearGradient(0, 0, width, 0);
+  gradient.addColorStop(0, '#1b8051'); gradient.addColorStop(0.34, '#62e8a0'); gradient.addColorStop(0.62, '#3ed694'); gradient.addColorStop(1, '#28754b');
+  for (let layer = 0; layer < 5; layer += 1) {
+    waveCtx.beginPath();
+    for (let x = 0; x <= width; x += 2) {
+      const t = x / width;
+      const envelope = Math.pow(Math.sin(Math.PI * t), 1.15);
+      const shape = Math.sin(t * Math.PI * 2.25 - phase + layer * 0.22) + 0.31 * Math.sin(t * Math.PI * 5.4 - phase * 0.7 + layer * 0.5);
+      const detail = Math.sin(t * Math.PI * 13 - phase * 1.2 + layer * 0.8);
+      const amplitude = (1.3 + level * 29) * envelope * (0.62 + layer * 0.09);
+      const y = center + shape * amplitude + detail * (0.35 + level * 2.4) * envelope;
+      if (x === 0) waveCtx.moveTo(x, y); else waveCtx.lineTo(x, y);
+    }
+    waveCtx.globalAlpha = active ? [0.22, 0.32, 0.44, 0.62, 0.96][layer] : [0.1, 0.15, 0.2, 0.28, 0.68][layer];
+    waveCtx.strokeStyle = gradient;
+    waveCtx.lineWidth = layer === 4 ? 1.55 : layer === 3 ? 1 : 0.55;
+    waveCtx.shadowBlur = layer === 4 ? (active ? 12 : 5) : layer === 3 ? 5 : 0;
+    waveCtx.shadowColor = '#54d982';
+    waveCtx.stroke();
+  }
+  waveCtx.globalAlpha = 1;
+  waveCtx.shadowBlur = 0;
+  if (active) waveFrame = requestAnimationFrame(drawWave); else waveFrame = 0;
+}
+function releaseAudioInput() {
+  if (micStream) { micStream.getTracks().forEach((track) => track.stop()); micStream = null; }
+  if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; analyser = null; }
+}
+function stopListening() {
+  listening = false;
+  $('#voice-button').classList.remove('listening', 'processing');
+  $('#voice-button').disabled = false;
+  $('#voice-button').setAttribute('aria-label', 'Start listening');
+  if (recognition) { try { recognition.stop(); } catch {} recognition = null; }
+  if (recordingTimer) { clearTimeout(recordingTimer); recordingTimer = null; }
+  if (mediaRecorder?.state === 'recording') {
+    processRecordingOnStop = false;
+    try { mediaRecorder.stop(); } catch {}
+  }
+  if (waveFrame) cancelAnimationFrame(waveFrame);
+  waveFrame = 0;
+  releaseAudioInput();
+  drawWave();
+}
+function setVoiceReady(caption = 'Tap the waveform to speak') {
+  $('#voice-button').disabled = false;
+  $('#voice-button').classList.remove('listening', 'processing');
+  $('#voice-button').setAttribute('aria-label', 'Start listening');
+  $('#voice-title').textContent = 'Ready when you are';
+  $('#voice-subtitle').textContent = 'Say the customer, amount, and whether it is udhaar or a payment.';
+  $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(caption)}</span>`;
+}
+async function startBrowserRecognition() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) { toast('Voice input is unavailable in this browser. Use New entry to record this transaction.'); return; }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (AudioContext) { audioContext = new AudioContext(); analyser = audioContext.createAnalyser(); analyser.fftSize = 256; audioContext.createMediaStreamSource(micStream).connect(analyser); }
+    recognition = new SpeechRecognition();
+    recognition.lang = voiceLanguage;
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    listening = true;
+    $('#voice-button').classList.add('listening');
+    $('#voice-button').setAttribute('aria-label', 'Stop listening');
+    $('#voice-title').textContent = 'I’m listening';
+    $('#voice-subtitle').textContent = 'Say the customer, amount, and whether it is udhaar or a payment.';
+    $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Listening… speak now</span>';
+    drawWave();
+    recognition.onresult = (event) => {
+      let transcript = '';
+      for (let i = event.resultIndex; i < event.results.length; i += 1) transcript += event.results[i][0].transcript;
+      $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(transcript)}</span>`;
+      if (event.results[event.results.length - 1].isFinal) {
+        stopListening();
+        $('#voice-title').textContent = 'Got it. Please confirm';
+        $('#voice-subtitle').textContent = 'Check the customer and amount before saving.';
+        setTimeout(() => { setVoiceReady(); prepareVoiceEntry(transcript); }, 250);
+      }
+    };
+    recognition.onerror = (event) => {
+      stopListening();
+      setVoiceReady();
+      if (event.error === 'not-allowed') toast('Allow microphone access in browser settings to use voice.');
+      else if (event.error !== 'no-speech' && event.error !== 'aborted') toast('Voice input paused. Use New entry to record this transaction.');
+    };
+    recognition.onend = () => { if (listening) stopListening(); };
+    recognition.start();
+  } catch (error) {
+    stopListening();
+    setVoiceReady();
+    toast(error.name === 'NotAllowedError' ? 'Allow microphone access in your browser to use voice.' : 'Could not start voice input. Choose New entry instead.');
+  }
+}
+function attachWaveAnalyser() {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (AudioContext) { audioContext = new AudioContext(); analyser = audioContext.createAnalyser(); analyser.fftSize = 256; audioContext.createMediaStreamSource(micStream).connect(analyser); }
+}
+async function startGnaniRecording() {
+  if (!window.MediaRecorder) return startBrowserRecognition();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    micStream = stream;
+    attachWaveAnalyser();
+    const mimeType = typeof MediaRecorder.isTypeSupported === 'function'
+      ? ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find((type) => MediaRecorder.isTypeSupported(type))
+      : '';
+    mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    recordedChunks = [];
+    processRecordingOnStop = false;
+    mediaRecorder.ondataavailable = (event) => { if (event.data?.size) recordedChunks.push(event.data); };
+    mediaRecorder.onerror = () => { stopListening(); setVoiceReady(); toast('Could not record voice. Use New entry instead.'); };
+    mediaRecorder.onstop = async () => {
+      const shouldTranscribe = processRecordingOnStop;
+      processRecordingOnStop = false;
+      if (recordingTimer) { clearTimeout(recordingTimer); recordingTimer = null; }
+      const audio = new Blob(recordedChunks, { type: mediaRecorder?.mimeType || 'audio/webm' });
+      recordedChunks = [];
+      mediaRecorder = null;
+      releaseAudioInput();
+      if (!shouldTranscribe) { setVoiceReady(); return; }
+      if (!audio.size) { setVoiceReady(); toast('No voice was recorded. Please try again.'); return; }
+      await transcribeGnaniAudio(audio);
+    };
+    mediaRecorder.start(250);
+    listening = true;
+    $('#voice-button').classList.add('listening');
+    $('#voice-button').setAttribute('aria-label', 'Stop and transcribe');
+    $('#voice-title').textContent = 'I’m listening';
+    $('#voice-subtitle').textContent = 'Say the customer, amount, and whether it is udhaar or a payment. Tap again when you finish.';
+    $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Listening… tap again to finish</span>';
+    drawWave();
+    recordingTimer = setTimeout(() => {
+      if (listening) { toast('Voice recording reached 60 seconds. Transcribing now.'); finishGnaniRecording(); }
+    }, 59000);
+  } catch (error) {
+    stopListening();
+    setVoiceReady();
+    toast(error.name === 'NotAllowedError' ? 'Allow microphone access in browser settings to use voice.' : 'Could not start voice recording. Use New entry instead.');
+  }
+}
+function finishGnaniRecording() {
+  if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+  processRecordingOnStop = true;
+  listening = false;
+  $('#voice-button').classList.remove('listening');
+  $('#voice-button').classList.add('processing');
+  $('#voice-button').disabled = true;
+  $('#voice-button').setAttribute('aria-label', 'Transcribing');
+  $('#voice-title').textContent = 'Transcribing your voice';
+  $('#voice-subtitle').textContent = 'Sending your recording to Gnani for transcription.';
+  $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Checking the recording…</span>';
+  if (waveFrame) cancelAnimationFrame(waveFrame);
+  waveFrame = 0;
+  drawWave();
+  mediaRecorder.stop();
+}
+async function encodeWav16k(audio) {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) throw new Error('Audio conversion is unavailable in this browser');
+  const context = new AudioContext();
+  let decoded;
+  try { decoded = await context.decodeAudioData(await audio.arrayBuffer()); }
+  finally { await context.close(); }
+  if (decoded.duration > 60.5) throw new Error('Voice recording must be under 60 seconds');
+  const outputRate = 16000;
+  const outputLength = Math.ceil(decoded.length * outputRate / decoded.sampleRate);
+  const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index));
+  const wav = new ArrayBuffer(44 + outputLength * 2);
+  const view = new DataView(wav);
+  const writeText = (offset, value) => [...value].forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0)));
+  writeText(0, 'RIFF'); view.setUint32(4, 36 + outputLength * 2, true); writeText(8, 'WAVE');
+  writeText(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, outputRate, true); view.setUint32(28, outputRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeText(36, 'data'); view.setUint32(40, outputLength * 2, true);
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourcePosition = index * decoded.sampleRate / outputRate;
+    const left = Math.floor(sourcePosition);
+    const fraction = sourcePosition - left;
+    let sample = 0;
+    for (const channel of channels) {
+      const first = channel[Math.min(left, channel.length - 1)] || 0;
+      const second = channel[Math.min(left + 1, channel.length - 1)] || 0;
+      sample += first + (second - first) * fraction;
+    }
+    sample /= channels.length;
+    const clamped = Math.max(-1, Math.min(1, sample));
+    view.setInt16(44 + index * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+  }
+  return new Blob([wav], { type: 'audio/wav' });
+}
+async function transcribeGnaniAudio(audio) {
+  try {
+    const wav = await encodeWav16k(audio);
+    const form = new FormData();
+    form.append('audio', wav, 'voice-command.wav');
+    form.append('language_code', voiceLanguage);
+    const session = await api('/api/v1/voice/sessions', { method: 'POST', body: form });
+    setVoiceReady();
+    $('#voice-title').textContent = 'Got it. Please confirm';
+    $('#voice-subtitle').textContent = 'Check the transcript, customer, and amount before saving.';
+    $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(session.transcript)}</span>`;
+    prepareVoiceEntry(session.transcript, session.id);
+  } catch (error) {
+    setVoiceReady('Voice transcription did not finish. Try again or use New entry.');
+    toast(error.message || 'Gnani could not transcribe this recording.');
+  }
+}
+async function startListening() {
+  if (startingVoice || listening) return;
+  if (!window.isSecureContext) { toast('Voice input needs HTTPS or localhost.'); return; }
+  if (!navigator.mediaDevices?.getUserMedia) { toast('Microphone input is unavailable here. Use New entry instead.'); return; }
+  startingVoice = true;
+  $('#voice-button').disabled = true;
+  try {
+    const capabilities = await api('/api/v1/voice/capabilities');
+    gnaniTtsEnabled = Boolean(capabilities.speech_output);
+    if (capabilities.speech_to_text && window.MediaRecorder && (window.AudioContext || window.webkitAudioContext)) {
+      await startGnaniRecording();
+      return;
+    }
+    if (capabilities.speech_to_text && !window.MediaRecorder) toast('This browser cannot record audio for Gnani. Trying its built-in speech recognition.');
+    await startBrowserRecognition();
+  } catch (error) {
+    toast(error.message || 'Could not check voice service. Use New entry instead.');
+  } finally {
+    startingVoice = false;
+    $('#voice-button').disabled = false;
+  }
+}
+$('#voice-button').addEventListener('click', () => {
+  if (awaitingVoiceReply) {
+    const entry = pendingVoiceEntry;
+    stopVoiceReply();
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    if (entry) showVoiceConfirmation(entry);
+    return;
+  }
+  if (!listening) { startListening(); return; }
+  if (mediaRecorder) finishGnaniRecording(); else stopListening();
+});
+drawWave();
+
+async function bootstrap() {
+  if (!API_BASE) { showAuth('Set the backend URL in frontend/config.js before signing in.'); return; }
+  if (!token) { showAuth(); return; }
+  try {
+    await loadWorkspace();
+    showApp();
+    renderAll();
+  } catch (error) {
+    showAuth(error.message === 'Invalid or expired access token' ? 'Your session expired. Please log in again.' : `Could not connect to backend: ${error.message}`);
+  }
+}
+bootstrap();
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.addEventListener('controllerchange', () => window.location.reload(), { once: true });
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').then((registration) => registration.update()).catch(() => {}));
+}

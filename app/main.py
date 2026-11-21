@@ -2,20 +2,22 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import case, func, select
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import case, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import Base, engine, get_db
-from app.models import Customer, EntryType, LedgerEntry, Merchant, VoiceSession, VoiceStatus
+from app.models import Customer, EntryType, LedgerEntry, Merchant, VoiceSession, VoiceStatus, normalize_customer_name
 from app.schemas import (
     CustomerCreate,
     CustomerOut,
@@ -25,6 +27,7 @@ from app.schemas import (
     MerchantCreate,
     MerchantLogin,
     MerchantOut,
+    MerchantUpdate,
     TTSRequest,
     TokenOut,
     VoiceConfirm,
@@ -35,8 +38,45 @@ from app.security import create_access_token, get_current_merchant, hash_passwor
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # For this starter, create missing tables automatically. Use migrations before production schema changes.
     Base.metadata.create_all(bind=engine)
+    # Add profile columns to existing starter databases without deleting shop or ledger data.
+    with engine.begin() as connection:
+        merchant_columns = {column["name"] for column in inspect(connection).get_columns("merchants")}
+        if "owner_name" not in merchant_columns:
+            connection.exec_driver_sql("ALTER TABLE merchants ADD COLUMN owner_name VARCHAR(120)")
+        if "location" not in merchant_columns:
+            connection.exec_driver_sql("ALTER TABLE merchants ADD COLUMN location VARCHAR(160)")
+        customer_columns = {column["name"] for column in inspect(connection).get_columns("customers")}
+        if "name_key" not in customer_columns:
+            connection.exec_driver_sql("ALTER TABLE customers ADD COLUMN name_key VARCHAR(512)")
+        seen_customer_keys = set()
+        customer_rows = connection.execute(
+            text("SELECT id, merchant_id, name, name_key FROM customers ORDER BY created_at, id")
+        ).mappings()
+        for row in customer_rows:
+            base_key = row["name_key"] or normalize_customer_name(row["name"] or "")
+            candidate = base_key
+            marker = (str(row["merchant_id"]), candidate)
+            if marker in seen_customer_keys:
+                candidate = f"{base_key}::legacy-duplicate::{row['id']}"
+                marker = (str(row["merchant_id"]), candidate)
+            seen_customer_keys.add(marker)
+            if row["name_key"] != candidate:
+                connection.execute(
+                    text("UPDATE customers SET name_key = :name_key WHERE id = :id"),
+                    {"name_key": candidate, "id": row["id"]},
+                )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_merchant_name_key "
+            "ON customers (merchant_id, name_key)"
+        )
+        ledger_columns = {column["name"] for column in inspect(connection).get_columns("ledger_entries")}
+        if "request_key" not in ledger_columns:
+            connection.exec_driver_sql("ALTER TABLE ledger_entries ADD COLUMN request_key VARCHAR(64)")
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_entries_request_key "
+            "ON ledger_entries (request_key)"
+        )
     yield
 
 
@@ -46,9 +86,17 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
 )
+
+
+@app.middleware("http")
+async def prevent_api_caching(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/") or request.url.path == "/health":
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def mint_token(merchant: Merchant) -> TokenOut:
@@ -81,9 +129,22 @@ def health():
     return {"status": "ok", "service": "voicekhata-api"}
 
 
+@app.get("/api/v1/voice/capabilities")
+def voice_capabilities(merchant: Merchant = Depends(get_current_merchant)):
+    del merchant
+    enabled = bool((settings.gnani_api_key or "").strip())
+    return {"speech_to_text": enabled, "speech_output": enabled}
+
+
 @app.post("/api/v1/auth/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED)
 def register(payload: MerchantCreate, db: Session = Depends(get_db)):
-    merchant = Merchant(name=payload.name, email=str(payload.email).lower(), password_hash=hash_password(payload.password))
+    merchant = Merchant(
+        name=payload.name,
+        email=str(payload.email).lower(),
+        password_hash=hash_password(payload.password),
+        owner_name=payload.owner_name,
+        location=payload.location,
+    )
     db.add(merchant)
     try:
         db.commit()
@@ -107,14 +168,51 @@ def me(merchant: Merchant = Depends(get_current_merchant)):
     return merchant
 
 
+@app.patch("/api/v1/auth/me", response_model=MerchantOut)
+def update_merchant_profile(
+    payload: MerchantUpdate,
+    db: Session = Depends(get_db),
+    merchant: Merchant = Depends(get_current_merchant),
+):
+    updates = payload.model_dump(exclude_unset=True)
+    if "name" in updates and updates["name"] is None:
+        raise HTTPException(status_code=422, detail="Shop name cannot be blank")
+    for field, value in updates.items():
+        setattr(merchant, field, value)
+    db.commit()
+    db.refresh(merchant)
+    return merchant
+
+
 @app.post("/api/v1/customers", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
 def create_customer(payload: CustomerCreate, db: Session = Depends(get_db), merchant: Merchant = Depends(get_current_merchant)):
-    customer = Customer(merchant_id=merchant.id, name=payload.name, phone=payload.phone.strip() if payload.phone else None)
+    name_key = normalize_customer_name(payload.name)
+    duplicate_name = db.scalar(
+        select(Customer.id).where(
+            Customer.merchant_id == merchant.id,
+            Customer.name_key == name_key,
+        )
+    )
+    if duplicate_name is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A customer with this name already exists. Select that customer or give the new customer a distinguishing name, such as 'Ramesh - Doodh wale'.",
+        )
+    customer = Customer(merchant_id=merchant.id, name=payload.name, name_key=name_key,
+                        phone=payload.phone.strip() if payload.phone else None)
     db.add(customer)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        duplicate_name = db.scalar(
+            select(Customer.id).where(Customer.merchant_id == merchant.id, Customer.name_key == name_key)
+        )
+        if duplicate_name is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="A customer with this name already exists. Select that customer or give the new customer a distinguishing name, such as 'Ramesh - Doodh wale'.",
+            )
         raise HTTPException(status_code=409, detail="This phone number is already used for another customer")
     db.refresh(customer)
     return CustomerOut.model_validate(customer).model_copy(update={"balance": Decimal("0.00")})
@@ -130,14 +228,69 @@ def list_customers(q: Optional[str] = None, db: Session = Depends(get_db), merch
 
 
 @app.post("/api/v1/ledger/entries", response_model=LedgerEntryOut, status_code=status.HTTP_201_CREATED)
-def create_ledger_entry(payload: LedgerEntryCreate, db: Session = Depends(get_db), merchant: Merchant = Depends(get_current_merchant)):
+def create_ledger_entry(
+    payload: LedgerEntryCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=64),
+    db: Session = Depends(get_db),
+    merchant: Merchant = Depends(get_current_merchant),
+):
+    request_key = None
+    if idempotency_key:
+        try:
+            request_key = str(UUID(idempotency_key.strip()))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Idempotency-Key must be a UUID")
+        prior = db.scalar(
+            select(LedgerEntry).where(
+                LedgerEntry.merchant_id == merchant.id,
+                LedgerEntry.request_key == request_key,
+            )
+        )
+        if prior is not None:
+            if (prior.customer_id != payload.customer_id or prior.amount != payload.amount
+                    or prior.entry_type != payload.entry_type
+                    or prior.note != (payload.note.strip() if payload.note else None)):
+                raise HTTPException(status_code=409, detail="This save key was already used for a different entry")
+            return prior
     owned_customer(db, merchant.id, payload.customer_id)
     entry = LedgerEntry(merchant_id=merchant.id, customer_id=payload.customer_id, amount=payload.amount,
-                        entry_type=payload.entry_type, note=payload.note.strip() if payload.note else None)
+                        entry_type=payload.entry_type, note=payload.note.strip() if payload.note else None,
+                        request_key=request_key)
     db.add(entry)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if request_key:
+            prior = db.scalar(
+                select(LedgerEntry).where(
+                    LedgerEntry.merchant_id == merchant.id,
+                    LedgerEntry.request_key == request_key,
+                )
+            )
+            expected_note = payload.note.strip() if payload.note else None
+            if (prior is not None and prior.customer_id == payload.customer_id and prior.amount == payload.amount
+                    and prior.entry_type == payload.entry_type and prior.note == expected_note):
+                return prior
+        raise HTTPException(status_code=409, detail="This entry could not be saved because a matching save was already processed")
     db.refresh(entry)
     return entry
+
+
+@app.get("/api/v1/ledger/entries", response_model=list[LedgerEntryOut])
+def list_ledger_entries(
+    limit: int = Query(default=500, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    merchant: Merchant = Depends(get_current_merchant),
+):
+    return db.scalars(
+        select(LedgerEntry)
+        .where(LedgerEntry.merchant_id == merchant.id)
+        .order_by(LedgerEntry.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
 
 
 @app.get("/api/v1/customers/{customer_id}/ledger", response_model=LedgerSummary)
@@ -158,10 +311,12 @@ async def transcribe_voice(
     db: Session = Depends(get_db),
     merchant: Merchant = Depends(get_current_merchant),
 ):
-    if not settings.gnani_api_key:
+    gnani_api_key = (settings.gnani_api_key or "").strip()
+    if not gnani_api_key:
         raise HTTPException(status_code=503, detail="Voice transcription is not configured on the server")
     allowed_types = {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/ogg", "audio/flac", "audio/aac", "audio/mp4", "audio/x-m4a", "application/octet-stream"}
-    if audio.content_type and audio.content_type not in allowed_types:
+    content_type = (audio.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type and content_type not in allowed_types:
         raise HTTPException(status_code=415, detail="Upload a WAV, MP3, OGG, FLAC, AAC, or M4A audio file")
     content = await audio.read(settings.max_audio_bytes + 1)
     if not content:
@@ -176,7 +331,7 @@ async def transcribe_voice(
         async with httpx.AsyncClient(timeout=45.0) as client:
             upstream = await client.post(
                 settings.gnani_stt_url,
-                headers={"X-API-Key-ID": settings.gnani_api_key},
+                headers={"X-API-Key-ID": gnani_api_key},
                 data=form,
                 files={"audio_file": (filename, content, audio.content_type or "application/octet-stream")},
             )
@@ -219,7 +374,11 @@ def confirm_voice_entry(
                         amount=payload.amount, entry_type=payload.entry_type, note=payload.note.strip() if payload.note else None)
     session.status = VoiceStatus.confirmed
     db.add(entry)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Voice entry has already been confirmed")
     db.refresh(entry)
     return entry
 
@@ -240,7 +399,8 @@ def cancel_voice_session(session_id: UUID, db: Session = Depends(get_db), mercha
 @app.post("/api/v1/voice/speak")
 async def speak(payload: TTSRequest, merchant: Merchant = Depends(get_current_merchant)):
     del merchant  # Authentication is required even though Gnani receives only the requested text.
-    if not settings.gnani_api_key:
+    gnani_api_key = (settings.gnani_api_key or "").strip()
+    if not gnani_api_key:
         raise HTTPException(status_code=503, detail="Voice output is not configured on the server")
     provider_payload = {
         "text": payload.text,
@@ -259,7 +419,7 @@ async def speak(payload: TTSRequest, merchant: Merchant = Depends(get_current_me
     try:
         request = client.build_request(
             "POST", settings.gnani_tts_url,
-            headers={"X-API-Key-ID": settings.gnani_api_key, "Content-Type": "application/json"},
+            headers={"X-API-Key-ID": gnani_api_key, "Content-Type": "application/json"},
             json=provider_payload,
         )
         upstream = await client.send(request, stream=True)
@@ -281,3 +441,9 @@ async def speak(payload: TTSRequest, merchant: Merchant = Depends(get_current_me
 
     # Gnani sends server-sent events containing base64 audio chunks.
     return StreamingResponse(stream_provider(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+# Serve the UI and API from one local origin, so a single Mac needs no IP/CORS setup.
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+if FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
