@@ -616,7 +616,11 @@ $('#register-form').addEventListener('submit', (event) => {
   const location = $('#register-location').value.trim() || null;
 
   if (!otp || otp.length < 4) {
-    setAuthError('Please enter the 6-digit OTP sent to your Gmail.');
+    if ($('#register-otp-section') && $('#register-otp-section').hidden) {
+      setAuthError("Pehle 'Send OTP' button par click karke Gmail par OTP mangwayein.");
+    } else {
+      setAuthError('Please enter the 6-digit OTP sent to your Gmail.');
+    }
     return;
   }
   if (!password || password.length < 10) {
@@ -643,7 +647,11 @@ if (forgotForm) {
     const new_password = $('#forgot-password').value;
 
     if (!otp || otp.length < 4) {
-      setAuthError('Please enter the 6-digit OTP code.');
+      if ($('#forgot-otp-section') && $('#forgot-otp-section').hidden) {
+        setAuthError("Pehle 'Send OTP' button par click karke Gmail par OTP mangwayein.");
+      } else {
+        setAuthError('Please enter the 6-digit OTP code.');
+      }
       return;
     }
     if (!new_password || new_password.length < 10) {

@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     max_audio_bytes: int = 15 * 1024 * 1024
     access_token_minutes: int = 720
 
-    # OTP Delivery Settings (Email / SMTP)
+    # OTP Delivery Settings (Email - Brevo HTTPS API / SMTP)
+    brevo_api_key: Optional[str] = None
     smtp_host: Optional[str] = None
     smtp_port: int = 587
     smtp_user: Optional[str] = None

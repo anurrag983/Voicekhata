@@ -61,21 +61,67 @@ async def deliver_otp_notification(
     is_live_delivered = False
 
     if target_type == "email":
-        # Check if SMTP is configured
-        if settings.smtp_host and settings.smtp_user and settings.smtp_password:
-            try:
-                msg = email.message.EmailMessage()
-                subject_tag = "Account Setup" if purpose == "registration" else "Password Reset"
-                msg["Subject"] = f"VoiceKhata OTP for {subject_tag}: {code}"
-                from_addr = settings.smtp_from_email or settings.smtp_user
-                msg["From"] = f"VoiceKhata <{from_addr}>"
-                msg["To"] = target
+        subject_tag = "Account Setup" if purpose == "registration" else "Password Reset"
+        purpose_desc = (
+            "setting up your VoiceKhata shop account"
+            if purpose == "registration"
+            else "resetting your VoiceKhata account password"
+        )
+        sender_email = (settings.smtp_from_email or settings.smtp_user or "anuragsingh90087@gmail.com").strip()
 
-                purpose_desc = (
-                    "setting up your VoiceKhata shop account"
-                    if purpose == "registration"
-                    else "resetting your VoiceKhata account password"
-                )
+        # 1. First priority: Brevo HTTPS REST API (Port 443 - works everywhere, never blocked on Render)
+        if settings.brevo_api_key:
+            try:
+                brevo_payload = {
+                    "sender": {"name": "VoiceKhata", "email": sender_email},
+                    "to": [{"email": target}],
+                    "subject": f"VoiceKhata OTP for {subject_tag}: {code}",
+                    "htmlContent": (
+                        f"<div style='font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px;background:#ffffff;'>"
+                        f"<h2 style='color:#14532d;margin-top:0;'>VoiceKhata Verification</h2>"
+                        f"<p style='color:#374151;font-size:15px;'>Namaste,</p>"
+                        f"<p style='color:#374151;font-size:15px;'>Your verification code for <strong>{purpose_desc}</strong> is:</p>"
+                        f"<div style='text-align:center;margin:24px 0;padding:16px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;font-size:32px;letter-spacing:6px;font-weight:700;color:#166534;'>"
+                        f"{code}"
+                        f"</div>"
+                        f"<p style='color:#6b7280;font-size:13px;'>This code is valid for 10 minutes. If you did not request this, please ignore this email.</p>"
+                        f"<hr style='border:none;border-top:1px solid #e5e7eb;margin:20px 0;'>"
+                        f"<small style='color:#9ca3af;'>VoiceKhata &bull; Your shop, in your voice</small>"
+                        f"</div>"
+                    ),
+                    "textContent": (
+                        f"Namaste,\n\n"
+                        f"Your VoiceKhata verification code is: {code}\n\n"
+                        f"Valid for 10 minutes for {purpose_desc}.\n\n"
+                        f"Team VoiceKhata"
+                    ),
+                }
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(
+                        "https://api.brevo.com/v3/smtp/email",
+                        headers={
+                            "api-key": settings.brevo_api_key.strip(),
+                            "Content-Type": "application/json",
+                            "accept": "application/json",
+                        },
+                        json=brevo_payload,
+                    )
+                    if resp.status_code in (200, 201):
+                        is_live_delivered = True
+                        logger.info("Sent OTP email to %s via Brevo HTTPS API", target)
+                    else:
+                        logger.error("Brevo API error (%s): %s", resp.status_code, resp.text)
+            except Exception as e:
+                logger.error("Failed to send OTP email via Brevo to %s: %s", target, e)
+
+        # 2. Fallback: SMTP (for environments where port 587 is unblocked, e.g. localhost)
+        if not is_live_delivered and settings.smtp_host and settings.smtp_user and settings.smtp_password:
+            try:
+                import asyncio
+                msg = email.message.EmailMessage()
+                msg["Subject"] = f"VoiceKhata OTP for {subject_tag}: {code}"
+                msg["From"] = f"VoiceKhata <{sender_email}>"
+                msg["To"] = target
                 text_content = (
                     f"Namaste,\n\n"
                     f"Your VoiceKhata verification code is: {code}\n\n"
@@ -86,12 +132,15 @@ async def deliver_otp_notification(
                 msg.set_content(text_content)
 
                 smtp_pw = settings.smtp_password.replace(" ", "").strip()
-                with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as server:
-                    server.starttls()
-                    server.login(settings.smtp_user.strip(), smtp_pw)
-                    server.send_message(msg)
+                def _send_sync():
+                    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as server:
+                        server.starttls()
+                        server.login(settings.smtp_user.strip(), smtp_pw)
+                        server.send_message(msg)
+
+                await asyncio.to_thread(_send_sync)
                 is_live_delivered = True
-                logger.info("Sent OTP email to %s", target)
+                logger.info("Sent OTP email to %s via SMTP", target)
             except Exception as e:
                 logger.error("Failed to send OTP email to %s: %s", target, e)
                 # Fall through to console logging
