@@ -25,14 +25,17 @@ Open this `android/` folder in Android Studio with JDK 17 or newer and Android S
 
 ## Assistant setup on a phone
 
-1. Install and open VoiceKhata. The first-run checklist is prefilled with the current Vercel frontend URL.
-2. Tap **Allow microphone access** and accept Android's permission prompt.
-3. Tap **Choose VoiceKhata** and accept Android's assistant-role prompt.
-4. Follow the phone-brand instructions under **Turn on your phone button gesture**. Android has no universal settings deep link for the power/side-button shortcut, so VoiceKhata opens Settings and shows the right menu path for the detected phone brand.
-5. Tap **Save and open VoiceKhata**, sign in, then long-press the configured assistant button. A native recorder opens, then VoiceKhata transcribes the WAV with Gnani and asks its existing voice conversation to resolve the customer and confirm before saving.
+1. Open VoiceKhata. The hosted login page appears first, with one setup prompt at a time on top of it.
+2. Allow microphone access when prompted, then choose **VoiceKhata** in Android's **Default digital assistant app** screen.
+3. Read the phone-brand button instructions and open Settings to enable the assistant shortcut if your device offers it. Android has no universal settings deep link for the power/side-button shortcut.
+4. Sign in. When the configured assistant gesture works, VoiceKhata opens its voice flow. Gnani transcribes the recording and the existing voice conversation resolves the customer and asks for confirmation before saving.
 
 The system assistant role is available from Android 10/API 29. On Android 8/API 26 through Android 9, the app uses Android's voice-input settings and assistant-activity launch support. Whether a power-button long-press is assignable, and whether an assistant can be invoked from the keyguard, depends on the phone maker and its settings; if unavailable, use the home-screen icon or a launcher shortcut. Android does not provide a universal OEM settings deep link, and an APK cannot force key remapping. Device authentication remains in control before shop data is opened.
 
 ## Build from a terminal
 
 From this `android/` directory, run `./gradlew assembleDebug` for the installable debug APK, then install it with `adb install -r app/build/outputs/apk/debug/app-debug.apk`. `./gradlew assembleRelease` enables R8 shrinking/optimization and writes an unsigned release APK; configure a private signing keystore before distributing a production build.
+
+## Using Android Studio to troubleshoot
+
+Open this `android/` folder in Android Studio, let Gradle sync, then run the `app` configuration on an emulator or a USB-debugging phone. Use **View → Tool Windows → Logcat** and filter for `com.voicekhata.app` to see assistant launch, permission, WebView, and audio errors. Android Studio helps build and inspect the native APK; the phone's own Settings still controls whether its power button is mapped to the selected assistant.

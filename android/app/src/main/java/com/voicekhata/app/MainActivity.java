@@ -8,14 +8,20 @@ import android.app.role.RoleManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.util.Log;
 import android.provider.Settings;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowInsets;
 import android.webkit.PermissionRequest;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
@@ -24,25 +30,52 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 public final class MainActivity extends Activity {
+    private static final String LOG_TAG = "VoiceKhata";
     private static final int REQUEST_MICROPHONE = 7301;
     private static final int REQUEST_ASSISTANT_ROLE = 7302;
     private static final String PREF_SETUP_VERSION = "phone_setup_version";
-    private static final int PHONE_SETUP_VERSION = 1;
+    private static final int PHONE_SETUP_VERSION = 2;
     private static final String PREFS = "voicekhata_mobile";
     private static final String PREF_WEB_URL = "web_app_url";
     private static final String DEFAULT_WEB_URL = "https://voicekhata-frontend.vercel.app";
+    private static final String DEFAULT_API_URL = "https://voicekhata-gxd0.onrender.com";
 
     private WebView webView;
     private View webAppRoot;
+    private FrameLayout appFrame;
+    private View handsFreeOverlay;
+    private TextView handsFreeStatus;
     private AudioRecorder audioRecorder;
-    private byte[] pendingNativeAudio;
+    private volatile byte[] pendingNativeAudio;
+    private volatile boolean nativeUploadInProgress;
+    private final ExecutorService nativeUploadExecutor = Executors.newSingleThreadExecutor();
     private boolean lockedAssistantCapture;
+    private boolean handsFreeAssistantSession;
+    private boolean finishedHandsFreeSession;
+    private Runnable handsFreeCompletionPoll;
+    private TextToSpeech nativeTts;
+    private boolean nativeTtsReady;
+    private boolean nativePromptInProgress;
     private boolean waitingForKeyguardDismiss;
     private String assistantWebUrl;
     private PermissionRequest pendingWebPermissionRequest;
@@ -50,6 +83,10 @@ public final class MainActivity extends Activity {
     private boolean waitingForAssistantPermission;
     private boolean waitingForSetupPermission;
     private boolean waitingToOpenAfterPermission;
+    private boolean setupWizardActive;
+    private boolean setupWizardScheduled;
+    private boolean waitingForWizardRole;
+    private boolean waitingForGestureSettings;
     private String pendingSetupUrl;
     private TextView microphoneStatus;
     private TextView assistantStatus;
@@ -58,11 +95,21 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        nativeTts = new TextToSpeech(this, status -> {
+            if (status != TextToSpeech.SUCCESS) return;
+            int languageStatus = nativeTts.setLanguage(new Locale("hi", "IN"));
+            nativeTtsReady = languageStatus != TextToSpeech.LANG_MISSING_DATA
+                    && languageStatus != TextToSpeech.LANG_NOT_SUPPORTED;
+        });
+        applySystemBarStyle();
         assistantLaunchPending = isAssistantIntent(getIntent());
-        String savedUrl = preferences().getString(PREF_WEB_URL, "");
-        boolean setupComplete = preferences().getInt(PREF_SETUP_VERSION, 0) >= PHONE_SETUP_VERSION;
-        if (savedUrl.isEmpty() || !setupComplete) showServerSetup();
-        else if (assistantLaunchPending && isDeviceLocked()) startLockedAssistantCapture(savedUrl);
+        handsFreeAssistantSession = assistantLaunchPending;
+        lockedAssistantCapture = assistantLaunchPending && isDeviceLocked();
+        Log.i(LOG_TAG, "Activity created; assistantLaunch=" + assistantLaunchPending + ", keyguardLocked=" + isDeviceLocked());
+        String savedUrl = preferences().getString(PREF_WEB_URL, DEFAULT_WEB_URL);
+        if (assistantLaunchPending && isDeviceLocked()) enableKeyguardVoiceSurface();
+        if (assistantLaunchPending && !hasMicrophonePermission() && isDeviceLocked()) showLockedUnlockPrompt(savedUrl,
+                "Unlock once and allow microphone access before using hands-free voice entry.");
         else showWebApp(savedUrl);
     }
 
@@ -72,10 +119,16 @@ public final class MainActivity extends Activity {
         setIntent(intent);
         if (isAssistantIntent(intent)) {
             assistantLaunchPending = true;
-            if (isDeviceLocked() && webView != null) {
-                startLockedAssistantCapture(preferences().getString(PREF_WEB_URL, DEFAULT_WEB_URL));
-            } else {
+            handsFreeAssistantSession = true;
+            finishedHandsFreeSession = false;
+            lockedAssistantCapture = isDeviceLocked();
+            if (lockedAssistantCapture) enableKeyguardVoiceSurface();
+            showHandsFreeOverlay("Starting VoiceKhata…");
+            Log.i(LOG_TAG, "Assistant intent received; keyguardLocked=" + isDeviceLocked());
+            if (webView != null) {
                 continueAssistantLaunch();
+            } else {
+                showWebApp(preferences().getString(PREF_WEB_URL, DEFAULT_WEB_URL));
             }
         }
     }
@@ -85,11 +138,20 @@ public final class MainActivity extends Activity {
         super.onResume();
         updateSetupStatuses();
         continueAfterDeviceUnlock();
+        if (waitingForGestureSettings) {
+            waitingForGestureSettings = false;
+            showGestureCompletePrompt();
+        } else if (waitingForWizardRole && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            waitingForWizardRole = false;
+            showGestureWizardPrompt();
+        }
     }
 
     @Override
     protected void onDestroy() {
         if (audioRecorder != null) audioRecorder.cancel();
+        nativeUploadExecutor.shutdownNow();
+        if (nativeTts != null) nativeTts.shutdown();
         super.onDestroy();
     }
 
@@ -98,8 +160,14 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_ASSISTANT_ROLE) {
             updateSetupStatuses();
+            if (waitingForWizardRole) {
+                waitingForWizardRole = false;
+                if (hasAssistantRole()) showGestureWizardPrompt();
+                else showAssistantWizardPrompt();
+                return;
+            }
             if (hasAssistantRole()) {
-                Toast.makeText(this, "VoiceKhata is now selected as your assistant.", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "VoiceKhata is selected as your assistant.", Toast.LENGTH_LONG).show();
             }
         }
     }
@@ -126,19 +194,86 @@ public final class MainActivity extends Activity {
         view.setText(value);
         view.setTextSize(size);
         view.setTextColor(0xff26332d);
+        view.setFontFeatureSettings("kern");
         return view;
     }
 
     private Button button(String label) {
         Button button = new Button(this);
         button.setText(label);
+        button.setAllCaps(false);
+        button.setTextSize(15);
+        button.setTextColor(0xff315d45);
+        button.setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL));
+        button.setPadding(dp(18), dp(12), dp(18), dp(12));
+        button.setMinHeight(dp(50));
+        button.setElevation(0);
+        button.setBackground(roundedBackground(0xffffffff, 0xffd9e1d8, 1));
         return button;
+    }
+
+    private GradientDrawable roundedBackground(int fill, int stroke, int strokeWidth) {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(fill);
+        shape.setCornerRadius(dp(13));
+        shape.setStroke(dp(strokeWidth), stroke);
+        return shape;
+    }
+
+    private void makePrimary(Button button) {
+        button.setTextColor(Color.WHITE);
+        button.setBackground(roundedBackground(0xff3f6c51, 0xff3f6c51, 1));
+    }
+
+    private void applySystemBarStyle() {
+        getWindow().setStatusBarColor(0xfff3f2ed);
+        getWindow().setNavigationBarColor(0xfff3f2ed);
+        int flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        getWindow().getDecorView().setSystemUiVisibility(flags);
+    }
+
+    private void applySystemBarInsets(View root) {
+        final int left = root.getPaddingLeft();
+        final int top = root.getPaddingTop();
+        final int right = root.getPaddingRight();
+        final int bottom = root.getPaddingBottom();
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            int insetLeft;
+            int insetTop;
+            int insetRight;
+            int insetBottom;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                insetLeft = bars.left;
+                insetTop = bars.top;
+                insetRight = bars.right;
+                insetBottom = bars.bottom;
+            } else {
+                insetLeft = insets.getSystemWindowInsetLeft();
+                insetTop = insets.getSystemWindowInsetTop();
+                insetRight = insets.getSystemWindowInsetRight();
+                insetBottom = insets.getSystemWindowInsetBottom();
+            }
+            view.setPadding(left + insetLeft, top + insetTop, right + insetRight, bottom + insetBottom);
+            return insets;
+        });
+        root.requestApplyInsets();
+    }
+
+    private void completeFirstRunAndOpen(String url) {
+        preferences().edit()
+                .putString(PREF_WEB_URL, url)
+                .putInt(PREF_SETUP_VERSION, PHONE_SETUP_VERSION)
+                .apply();
+        showWebApp(url);
     }
 
     private void showServerSetup() {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(0xfff3f2ed);
+        applySystemBarInsets(scroll);
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(dp(24), dp(28), dp(24), dp(28));
@@ -188,6 +323,7 @@ public final class MainActivity extends Activity {
         layout.addView(address, addressParams);
 
         Button open = button("Save and open VoiceKhata");
+        makePrimary(open);
         addSetupButton(layout, open);
 
         open.setOnClickListener(view -> {
@@ -202,9 +338,7 @@ public final class MainActivity extends Activity {
                 requestMicrophoneForSetup();
                 return;
             }
-            preferences().edit().putString(PREF_WEB_URL, url).apply();
-            preferences().edit().putInt(PREF_SETUP_VERSION, PHONE_SETUP_VERSION).apply();
-            showWebApp(url);
+            completeFirstRunAndOpen(url);
         });
         updateSetupStatuses();
         setContentView(scroll);
@@ -228,11 +362,90 @@ public final class MainActivity extends Activity {
     private void requestMicrophoneForSetup() {
         if (hasMicrophonePermission()) {
             updateSetupStatuses();
-            Toast.makeText(this, "Microphone access is already allowed.", Toast.LENGTH_SHORT).show();
+            if (setupWizardActive) showAssistantWizardPrompt();
+            else Toast.makeText(this, "Microphone access is already allowed.", Toast.LENGTH_SHORT).show();
             return;
         }
         waitingForSetupPermission = true;
         requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, REQUEST_MICROPHONE);
+    }
+
+    private void beginSetupWizard() {
+        setupWizardActive = true;
+        if (!hasMicrophonePermission()) showMicrophoneWizardPrompt();
+        else showAssistantWizardPrompt();
+    }
+
+    private void showMicrophoneWizardPrompt() {
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Step 1 of 3 · Microphone")
+                .setMessage("Allow microphone access so VoiceKhata can record a voice entry when you ask it to.")
+                .setNegativeButton("Later", (d, w) -> finishSetupWizard())
+                .setPositiveButton("Allow microphone", (d, w) -> requestMicrophoneForSetup())
+                .create();
+        showGreenDialog(dialog);
+    }
+
+    private void showAssistantWizardPrompt() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || hasAssistantRole()) {
+            showGestureWizardPrompt();
+            return;
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Step 2 of 3 · Default assistant")
+                .setMessage("Choose VoiceKhata on Android’s next screen. This lets your phone send its supported assistant shortcut to the app.")
+                .setNegativeButton("Later", (d, w) -> finishSetupWizard())
+                .setPositiveButton("Choose VoiceKhata", (d, w) -> {
+                    waitingForWizardRole = true;
+                    requestAssistantSelection();
+                })
+                .create();
+        showGreenDialog(dialog);
+    }
+
+    private void showGestureWizardPrompt() {
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Step 3 of 3 · Phone button")
+                .setMessage(OemGestureHelper.instructions() + "\n\nPhone makers control this shortcut; VoiceKhata cannot change it automatically.")
+                .setNegativeButton("Skip for now", (d, w) -> finishSetupWizard())
+                .setPositiveButton("Open phone settings", (d, w) -> {
+                    waitingForGestureSettings = true;
+                    try { startActivity(OemGestureHelper.settingsIntent()); }
+                    catch (Exception error) {
+                        waitingForGestureSettings = false;
+                        Toast.makeText(this, "Open Settings and search for assistant or power button.", Toast.LENGTH_LONG).show();
+                        showGestureCompletePrompt();
+                    }
+                })
+                .create();
+        showGreenDialog(dialog);
+    }
+
+    private void showGestureCompletePrompt() {
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Phone settings")
+                .setMessage("If you enabled VoiceKhata for the power/side-button assistant shortcut, tap Done. Otherwise, open Settings again and follow the menu path.")
+                .setNegativeButton("Open settings again", (d, w) -> showGestureWizardPrompt())
+                .setPositiveButton("Done", (d, w) -> finishSetupWizard())
+                .create();
+        showGreenDialog(dialog);
+    }
+
+    private void showGreenDialog(AlertDialog dialog) {
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(0xff3f6c51);
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(0xff68786d);
+        });
+        dialog.show();
+    }
+
+    private void finishSetupWizard() {
+        setupWizardActive = false;
+        preferences().edit()
+                .putString(PREF_WEB_URL, preferences().getString(PREF_WEB_URL, DEFAULT_WEB_URL))
+                .putInt(PREF_SETUP_VERSION, PHONE_SETUP_VERSION)
+                .apply();
+        Toast.makeText(this, "Setup saved. VoiceKhata login is ready.", Toast.LENGTH_SHORT).show();
     }
 
     private boolean hasAssistantRole() {
@@ -292,20 +505,21 @@ public final class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xfff3f2ed);
+        applySystemBarInsets(root);
 
         LinearLayout bar = new LinearLayout(this);
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(dp(8), dp(4), dp(8), dp(4));
+        bar.setPadding(dp(16), dp(3), dp(12), dp(3));
         bar.setBackgroundColor(0xffe5e9df);
         TextView brand = text("VoiceKhata", 16);
         brand.setTypeface(null, 1);
         bar.addView(brand, new LinearLayout.LayoutParams(0, -2, 1));
-        Button setup = button("Settings");
-        setup.setOnClickListener(view -> showServerSetup());
+        Button setup = button("Setup");
+        setup.setTextSize(12);
+        setup.setMinHeight(dp(40));
+        setup.setPadding(dp(10), dp(6), dp(10), dp(6));
+        setup.setOnClickListener(view -> beginSetupWizard());
         bar.addView(setup, new LinearLayout.LayoutParams(-2, -2));
-        Button assistant = button("Phone assistant");
-        assistant.setOnClickListener(view -> showServerSetup());
-        bar.addView(assistant, new LinearLayout.LayoutParams(-2, -2));
         root.addView(bar, new LinearLayout.LayoutParams(-1, -2));
 
         webView = new WebView(this);
@@ -326,7 +540,14 @@ public final class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String pageUrl) {
                 super.onPageFinished(view, pageUrl);
+                boolean launchedByAssistant = assistantLaunchPending;
+                installNativeAudioHandoff(view);
                 continueAssistantLaunch();
+                if (!launchedByAssistant && !setupWizardScheduled
+                        && preferences().getInt(PREF_SETUP_VERSION, 0) < PHONE_SETUP_VERSION) {
+                    setupWizardScheduled = true;
+                    view.postDelayed(MainActivity.this::beginSetupWizard, 900);
+                }
             }
         });
         webView.setWebChromeClient(new WebChromeClient() {
@@ -362,7 +583,12 @@ public final class MainActivity extends Activity {
         });
         root.addView(webView, new LinearLayout.LayoutParams(-1, 0, 1));
         webAppRoot = root;
-        setContentView(webAppRoot);
+        appFrame = new FrameLayout(this);
+        appFrame.setBackgroundColor(Color.WHITE);
+        appFrame.addView(root, new FrameLayout.LayoutParams(-1, -1));
+        webAppRoot = root;
+        if (handsFreeAssistantSession) addHandsFreeOverlay("Starting VoiceKhata…");
+        setContentView(appFrame);
         webView.loadUrl(url);
     }
 
@@ -376,7 +602,10 @@ public final class MainActivity extends Activity {
                         Toast.LENGTH_LONG).show());
                 return false;
             }
-            runOnUiThread(MainActivity.this::beginNativeCapture);
+            runOnUiThread(() -> {
+                if (handsFreeAssistantSession) speakPromptThenCapture();
+                else beginNativeCapture();
+            });
             return true;
         }
 
@@ -388,7 +617,23 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void cancelCapture() {
             if (audioRecorder != null) audioRecorder.cancel();
-            runOnUiThread(() -> setContentView(webAppRoot));
+            runOnUiThread(() -> {
+                if (handsFreeAssistantSession) finishHandsFreeSession();
+                else showWebRoot();
+            });
+        }
+
+        @JavascriptInterface
+        public boolean isHandsFreeSession() { return handsFreeAssistantSession && !finishedHandsFreeSession; }
+
+        @JavascriptInterface
+        public void setHandsFreeStatus(String status) {
+            runOnUiThread(() -> updateHandsFreeStatus(status));
+        }
+
+        @JavascriptInterface
+        public void finishHandsFreeSession() {
+            runOnUiThread(MainActivity.this::finishHandsFreeSession);
         }
 
         @JavascriptInterface
@@ -402,37 +647,331 @@ public final class MainActivity extends Activity {
         public boolean hasPendingAudio() {
             return pendingNativeAudio != null;
         }
+
+        @JavascriptInterface
+        public void transcribePendingAudio(String apiBaseUrl, String accessToken) {
+            uploadPendingNativeAudio(apiBaseUrl, accessToken);
+        }
+    }
+
+    private void speakPromptThenCapture() {
+        if (nativePromptInProgress || audioRecorder != null) return;
+        nativePromptInProgress = true;
+        updateHandsFreeStatus("बोलिए…");
+        if (nativeTts == null || !nativeTtsReady) {
+            nativePromptInProgress = false;
+            beginNativeCapture();
+            return;
+        }
+        nativeTts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+            @Override public void onStart(String utteranceId) { }
+            @Override public void onDone(String utteranceId) {
+                runOnUiThread(() -> {
+                    nativePromptInProgress = false;
+                    if (handsFreeAssistantSession && !finishedHandsFreeSession) beginNativeCapture();
+                });
+            }
+            @Override public void onError(String utteranceId) {
+                runOnUiThread(() -> {
+                    nativePromptInProgress = false;
+                    if (handsFreeAssistantSession && !finishedHandsFreeSession) beginNativeCapture();
+                });
+            }
+        });
+        int result = nativeTts.speak("बोलिए", TextToSpeech.QUEUE_FLUSH, null, "voicekhata-assistant-prompt");
+        if (result == TextToSpeech.ERROR) {
+            nativePromptInProgress = false;
+            beginNativeCapture();
+        } else if (appFrame != null) {
+            appFrame.postDelayed(() -> {
+                if (nativePromptInProgress && handsFreeAssistantSession && !finishedHandsFreeSession) {
+                    nativePromptInProgress = false;
+                    beginNativeCapture();
+                }
+            }, 3500);
+        }
     }
 
     private void beginNativeCapture() {
         if (audioRecorder != null) return;
+        Log.i(LOG_TAG, "Native microphone capture starting; keyguardCapture=" + lockedAssistantCapture);
         audioRecorder = new AudioRecorder(this);
         vibrateForCapture();
         showNativeCaptureControls();
         audioRecorder.start((wav, error) -> runOnUiThread(() -> {
             audioRecorder = null;
-            if (lockedAssistantCapture) {
+            if (handsFreeAssistantSession) {
                 if (error != null) {
-                    Toast.makeText(this, error, Toast.LENGTH_LONG).show();
-                    setContentView(webAppRoot);
+                    Log.e(LOG_TAG, "Assistant capture failed: " + error);
+                    updateHandsFreeStatus("आवाज़ रिकॉर्ड नहीं हो पाई। दोबारा assistant button दबाएँ।");
+                    speakNativeMessage("आवाज़ रिकॉर्ड नहीं हो पाई। दोबारा कोशिश करें।", true);
                     return;
                 }
-                if (wav == null) return;
+                if (wav == null) { Log.i(LOG_TAG, "Locked capture was cancelled."); return; }
+                Log.i(LOG_TAG, "Assistant capture finished; WAV bytes=" + wav.length + ", processing without opening the ledger UI.");
                 pendingNativeAudio = wav;
-                waitingForKeyguardDismiss = true;
-                requestUnlockBeforeOpeningLedger();
+                updateHandsFreeStatus("आपकी बात समझ रहा हूँ…");
+                handlePendingNativeAudioInWebView();
+                startHandsFreeCompletionPoll();
                 return;
             }
-            setContentView(webAppRoot);
+            showWebRoot();
             if (error != null) {
+                Log.e(LOG_TAG, "Capture failed: " + error);
                 Toast.makeText(this, error, Toast.LENGTH_LONG).show();
                 return;
             }
-            if (wav == null || webView == null) return;
+            if (wav == null || webView == null) { Log.i(LOG_TAG, "Capture cancelled or WebView not ready."); return; }
+            Log.i(LOG_TAG, "Capture finished; WAV bytes=" + wav.length + ", handing to WebView.");
             pendingNativeAudio = wav;
-            webView.post(() -> webView.evaluateJavascript(
-                    "window.voiceKhataNativeAudioReady && window.voiceKhataNativeAudioReady()", null));
+            handlePendingNativeAudioInWebView();
         }));
+    }
+
+    private void installNativeAudioHandoff(WebView target) {
+        String script = "(function(){"
+                + "if(window.__voiceKhataNativeHandoff)return true;window.__voiceKhataNativeHandoff=true;"
+                + "window.voiceKhataNativeBeginUpload=function(){"
+                + "if(!window.VoiceKhataNative||!VoiceKhataNative.hasPendingAudio())return false;"
+                + "var token=localStorage.getItem('voicekhata.access_token')||'';"
+                + "var base=(window.VOICEKHATA_CONFIG&&VOICEKHATA_CONFIG.apiBaseUrl)||'" + DEFAULT_API_URL + "';"
+                + "if(!token)return false;VoiceKhataNative.transcribePendingAudio(base,token);return true;};"
+                + "if(typeof window.startListening==='function'&&!window.__voiceKhataOriginalStartListening){"
+                + "window.__voiceKhataOriginalStartListening=window.startListening;"
+                + "window.startListening=function(){if(window.voiceKhataNativeBeginUpload&&window.voiceKhataNativeBeginUpload())return Promise.resolve();"
+                + "return window.__voiceKhataOriginalStartListening.apply(this,arguments);};}"
+                + "return true;})()";
+        target.evaluateJavascript(script, null);
+    }
+
+    private void handlePendingNativeAudioInWebView() {
+        if (webView == null) return;
+        String script = "(function(){if(window.voiceKhataNativeAudioReady){window.voiceKhataNativeAudioReady();return true;}"
+                + "if(window.voiceKhataNativeBeginUpload)return window.voiceKhataNativeBeginUpload();return false;})()";
+        webView.post(() -> webView.evaluateJavascript(script, null));
+    }
+
+    private void showWebRoot() {
+        if (appFrame == null || webAppRoot == null) return;
+        appFrame.removeAllViews();
+        appFrame.addView(webAppRoot, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private void addHandsFreeOverlay(String status) {
+        if (appFrame == null) return;
+        if (handsFreeOverlay != null && handsFreeOverlay.getParent() == appFrame) {
+            updateHandsFreeStatus(status);
+            return;
+        }
+        LinearLayout overlay = new LinearLayout(this);
+        overlay.setOrientation(LinearLayout.VERTICAL);
+        overlay.setGravity(Gravity.CENTER);
+        overlay.setPadding(dp(28), dp(36), dp(28), dp(36));
+        overlay.setBackgroundColor(0xfff3f2ed);
+        TextView brand = text("VoiceKhata", 20);
+        brand.setTypeface(null, 1);
+        overlay.addView(brand);
+        TextView prompt = text("बोलिए… जैसे ‘रमेश 500 रुपये उधार’", 24);
+        prompt.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams promptParams = new LinearLayout.LayoutParams(-1, -2);
+        promptParams.topMargin = dp(32);
+        overlay.addView(prompt, promptParams);
+        handsFreeStatus = text(status, 16);
+        handsFreeStatus.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, -2);
+        statusParams.topMargin = dp(18);
+        overlay.addView(handsFreeStatus, statusParams);
+        handsFreeOverlay = overlay;
+        appFrame.addView(handsFreeOverlay, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private void showHandsFreeOverlay(String status) {
+        if (appFrame != null) addHandsFreeOverlay(status);
+    }
+
+    private void updateHandsFreeStatus(String status) {
+        if (status == null || status.isBlank()) return;
+        if (handsFreeStatus != null) handsFreeStatus.setText(status);
+        Log.i(LOG_TAG, "Hands-free state: " + status);
+    }
+
+    private void finishHandsFreeSession() {
+        if (finishedHandsFreeSession) return;
+        finishedHandsFreeSession = true;
+        handsFreeAssistantSession = false;
+        assistantLaunchPending = false;
+        if (handsFreeCompletionPoll != null && appFrame != null) appFrame.removeCallbacks(handsFreeCompletionPoll);
+        handsFreeCompletionPoll = null;
+        if (lockedAssistantCapture || isDeviceLocked()) {
+            Log.i(LOG_TAG, "Hands-free session complete; returning to keyguard.");
+            finish();
+            return;
+        }
+        lockedAssistantCapture = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(false);
+            setTurnScreenOn(false);
+        }
+        getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                | android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                | android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+        if (appFrame != null && handsFreeOverlay != null) appFrame.removeView(handsFreeOverlay);
+        handsFreeOverlay = null;
+        handsFreeStatus = null;
+    }
+
+    // Compatibility with an already-deployed Vercel page: finish the assistant surface
+    // when its existing voice UI reports that the transaction has been saved/cancelled.
+    private void startHandsFreeCompletionPoll() {
+        if (webView == null || appFrame == null) return;
+        if (handsFreeCompletionPoll != null) appFrame.removeCallbacks(handsFreeCompletionPoll);
+        handsFreeCompletionPoll = new Runnable() {
+            int elapsed;
+            @Override public void run() {
+                if (!handsFreeAssistantSession || finishedHandsFreeSession || webView == null) return;
+                webView.evaluateJavascript("(function(){if(window.__voiceKhataHandsFreeSpeechActive)return '__SPEAKING__';var c=document.querySelector('#voice-caption');return c?c.textContent:''})()", value -> {
+                    String caption = value == null ? "" : value.toLowerCase();
+                    if (caption.contains("__speaking__")) {
+                        if (elapsed++ < 180) appFrame.postDelayed(this, 1000);
+                        return;
+                    }
+                    boolean done = caption.contains("up to date") || caption.contains("nothing was saved")
+                            || caption.contains("entry saved") || caption.contains("entries saved");
+                    if (done) appFrame.postDelayed(MainActivity.this::finishHandsFreeSession, 8000);
+                    else if (elapsed++ < 180) appFrame.postDelayed(this, 1000);
+                });
+            }
+        };
+        appFrame.postDelayed(handsFreeCompletionPoll, 1200);
+    }
+
+    private void speakNativeMessage(String message, boolean finishAfter) {
+        // Fallback UI remains visible and private. The web app's Hindi voice is preferred
+        // for normal dialogue; this is only used if the initial native recording fails.
+        updateHandsFreeStatus(message);
+        if (nativeTtsReady && nativeTts != null) {
+            nativeTts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                @Override public void onStart(String utteranceId) { }
+                @Override public void onDone(String utteranceId) {
+                    if (finishAfter) runOnUiThread(MainActivity.this::finishHandsFreeSession);
+                }
+                @Override public void onError(String utteranceId) {
+                    if (finishAfter) runOnUiThread(MainActivity.this::finishHandsFreeSession);
+                }
+            });
+            nativeTts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "voicekhata-failure-message");
+        } else if (finishAfter && appFrame != null) appFrame.postDelayed(this::finishHandsFreeSession, 3500);
+    }
+
+    private void uploadPendingNativeAudio(String apiBaseUrl, String accessToken) {
+        byte[] audio = pendingNativeAudio;
+        if (audio == null || audio.length == 0 || nativeUploadInProgress) return;
+        Uri api = Uri.parse(apiBaseUrl == null ? "" : apiBaseUrl.trim());
+        if (!"https".equalsIgnoreCase(api.getScheme())
+                || !"voicekhata-gxd0.onrender.com".equalsIgnoreCase(api.getHost())
+                || (api.getPath() != null && !api.getPath().isEmpty() && !"/".equals(api.getPath()))
+                || api.getUserInfo() != null || api.getQuery() != null || api.getFragment() != null
+                || accessToken == null || accessToken.isBlank()) {
+            reportNativeUploadFailure("VoiceKhata could not connect securely. Please try the assistant again.");
+            return;
+        }
+        nativeUploadInProgress = true;
+        Log.i(LOG_TAG, "Starting authenticated WAV upload; bytes=" + audio.length + ". Token and transcript are not logged.");
+        if (webView != null) webView.post(() -> webView.evaluateJavascript(
+                "(function(){var t=document.querySelector('#voice-title');if(t)t.textContent='Transcribing your voice';"
+                        + "var c=document.querySelector('#voice-caption');if(c)c.textContent='Sending your recording to Gnani…';})()", null));
+        nativeUploadExecutor.execute(() -> {
+            HttpURLConnection connection = null;
+            try {
+                String boundary = "VoiceKhata" + System.nanoTime();
+                connection = (HttpURLConnection) new URL(DEFAULT_API_URL + "/api/v1/voice/sessions").openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(25_000);
+                connection.setReadTimeout(100_000);
+                connection.setInstanceFollowRedirects(false);
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Authorization", "Bearer " + accessToken);
+                connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+                connection.setRequestProperty("Accept", "application/json");
+
+                try (BufferedOutputStream output = new BufferedOutputStream(connection.getOutputStream())) {
+                    writeMultipartText(output, boundary, "language_code", "hi-IN");
+                    output.write(("--" + boundary + "\r\n"
+                            + "Content-Disposition: form-data; name=\"audio\"; filename=\"voice-command.wav\"\r\n"
+                            + "Content-Type: audio/wav\r\n\r\n").getBytes(StandardCharsets.UTF_8));
+                    output.write(audio);
+                    output.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+                }
+
+                int status = connection.getResponseCode();
+                Log.i(LOG_TAG, "Voice session endpoint responded with HTTP " + status + ".");
+                InputStream responseStream = status >= 200 && status < 300
+                        ? connection.getInputStream() : connection.getErrorStream();
+                String responseBody = readResponse(responseStream);
+                if (status < 200 || status >= 300) {
+                    throw new IllegalStateException(status == 401 || status == 403
+                            ? "Your login expired. Sign in again, then repeat the voice entry."
+                            : "Voice transcription failed. Check your connection and try again.");
+                }
+                JSONObject session = new JSONObject(responseBody);
+                String transcript = session.getString("transcript");
+                String sessionId = session.getString("id");
+                if (transcript.isBlank() || sessionId.isBlank()) throw new IllegalStateException("Gnani returned an empty transcript. Please repeat the entry.");
+                Log.i(LOG_TAG, "Transcription returned; opening existing confirmation flow.");
+                if (pendingNativeAudio == audio) pendingNativeAudio = null;
+                runOnUiThread(() -> {
+                    nativeUploadInProgress = false;
+                    if (webView == null) return;
+                    String callback = "(function(){if(typeof window.prepareVoiceEntry==='function'){window.prepareVoiceEntry("
+                            + JSONObject.quote(transcript) + "," + JSONObject.quote(sessionId)
+                            + ");return true;}return false;})()";
+                    webView.evaluateJavascript(callback, result -> {
+                        if ("false".equals(result)) reportNativeUploadFailure("Transcript arrived, but the confirmation screen is unavailable. Reopen VoiceKhata and retry.");
+                    });
+                });
+            } catch (Exception error) {
+                String message = error.getMessage() == null ? "Voice transcription failed. Please try again." : error.getMessage();
+                Log.e(LOG_TAG, "Native voice handoff failed: " + message);
+                runOnUiThread(() -> {
+                    nativeUploadInProgress = false;
+                    reportNativeUploadFailure(message);
+                });
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        });
+    }
+
+    private void writeMultipartText(BufferedOutputStream output, String boundary, String name, String value) throws Exception {
+        output.write(("--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n"
+                + value + "\r\n").getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String readResponse(InputStream stream) throws Exception {
+        if (stream == null) return "";
+        try (InputStream input = new BufferedInputStream(stream);
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                output.write(buffer, 0, count);
+                if (output.size() > 128 * 1024) throw new IllegalStateException("Backend response was too large.");
+            }
+            return output.toString(StandardCharsets.UTF_8);
+        }
+    }
+
+    private void reportNativeUploadFailure(String message) {
+        if (webView != null) {
+            String script = "(function(){var t=document.querySelector('#voice-title');if(t)t.textContent='Voice entry not transcribed';"
+                    + "var c=document.querySelector('#voice-caption');if(c)c.textContent=" + JSONObject.quote(message)
+                    + ";if(typeof window.voiceKhataNativeError==='function')window.voiceKhataNativeError(" + JSONObject.quote(message) + ");"
+                    + "else if(typeof window.toast==='function')window.toast(" + JSONObject.quote(message) + ");})()";
+            webView.post(() -> webView.evaluateJavascript(script, null));
+        } else {
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+        }
     }
 
     private boolean isDeviceLocked() {
@@ -448,7 +987,8 @@ public final class MainActivity extends Activity {
             return;
         }
         lockedAssistantCapture = true;
-        beginNativeCapture();
+        handsFreeAssistantSession = true;
+        showWebApp(url);
     }
 
     private void enableKeyguardVoiceSurface() {
@@ -496,6 +1036,7 @@ public final class MainActivity extends Activity {
         panel.setGravity(Gravity.CENTER);
         panel.setPadding(dp(28), dp(36), dp(28), dp(36));
         panel.setBackgroundColor(0xfff3f2ed);
+        applySystemBarInsets(panel);
         TextView title = text("Unlock to continue", 24);
         title.setTypeface(null, 1);
         panel.addView(title);
@@ -505,6 +1046,7 @@ public final class MainActivity extends Activity {
         bodyParams.topMargin = dp(16);
         panel.addView(body, bodyParams);
         Button unlock = button("Unlock and review entry");
+        makePrimary(unlock);
         addSetupButton(panel, unlock);
         unlock.setOnClickListener(view -> requestUnlockBeforeOpeningLedger());
         setContentView(panel);
@@ -543,11 +1085,16 @@ public final class MainActivity extends Activity {
     }
 
     private void showNativeCaptureControls() {
+        if (handsFreeAssistantSession) {
+            showHandsFreeOverlay("सुन रहा हूँ… अपनी एंट्री बोलिए।");
+            return;
+        }
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setGravity(Gravity.CENTER);
         panel.setPadding(dp(28), dp(36), dp(28), dp(36));
         panel.setBackgroundColor(0xfff3f2ed);
+        applySystemBarInsets(panel);
 
         TextView brand = text("VoiceKhata", 18);
         brand.setTypeface(null, 1);
@@ -564,6 +1111,7 @@ public final class MainActivity extends Activity {
         panel.addView(hint, hintParams);
 
         Button finish = button("Finish recording");
+        makePrimary(finish);
         addSetupButton(panel, finish);
         finish.setOnClickListener(view -> { if (audioRecorder != null) audioRecorder.finish(); });
         Button cancel = button("Cancel");
@@ -572,17 +1120,18 @@ public final class MainActivity extends Activity {
             if (audioRecorder != null) audioRecorder.cancel();
             audioRecorder = null;
             pendingNativeAudio = null;
-            if (lockedAssistantCapture) {
+            if (handsFreeAssistantSession || lockedAssistantCapture) {
                 finish();
                 return;
             }
-            setContentView(webAppRoot);
+            showWebRoot();
         });
         setContentView(panel);
     }
 
     private void continueAssistantLaunch() {
         if (!assistantLaunchPending || webView == null) return;
+        Log.i(LOG_TAG, "Assistant launch continuing; microphonePermission=" + hasMicrophonePermission());
         if (!hasMicrophonePermission()) {
             waitingForAssistantPermission = true;
             requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, REQUEST_MICROPHONE);
@@ -611,7 +1160,9 @@ public final class MainActivity extends Activity {
             updateSetupStatuses();
             if (granted) {
                 Toast.makeText(this, "Microphone access is enabled.", Toast.LENGTH_SHORT).show();
-                if (waitingToOpenAfterPermission && pendingSetupUrl != null) {
+                if (setupWizardActive) {
+                    showAssistantWizardPrompt();
+                } else if (waitingToOpenAfterPermission && pendingSetupUrl != null) {
                     preferences().edit()
                             .putString(PREF_WEB_URL, pendingSetupUrl)
                             .putInt(PREF_SETUP_VERSION, PHONE_SETUP_VERSION)

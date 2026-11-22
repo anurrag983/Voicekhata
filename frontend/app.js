@@ -15,14 +15,20 @@ let token = (() => {
 let merchant = null;
 let customers = [];
 let transactions = [];
+let workspaceLoadError = '';
+let retryingWorkspaceLoad = false;
 let selectedCustomerId = '';
 let selectedCustomerLedger = null;
+let ledgerView = 'all';
+let chartStartDate = '';
+let chartEndDate = '';
 let customerLedgerLoading = false;
 let customerLedgerError = '';
-let profile = { shopName: '', ownerName: '', location: '' };
+let profile = { shopName: '', ownerName: '', location: '', upiId: '' };
 let pendingVoiceEntry = null;
 let voiceConversation = null;
-let recognition = null;
+let handsFreeQuestionRetries = 0;
+let handsFreeTranscriptionRetries = 0;
 let listening = false;
 let micStream = null;
 let mediaRecorder = null;
@@ -36,6 +42,7 @@ let awaitingVoiceReply = false;
 let voiceReplyRecognition = null;
 let voiceReplyRecorder = null;
 let voiceReplyStream = null;
+let voiceReplyProcessedStream = null;
 let voiceReplyContext = null;
 let voiceReplyFrame = 0;
 let discardVoiceReply = false;
@@ -48,6 +55,7 @@ let gnaniSttEnabled = false;
 let gnaniTtsEnabled = false;
 let voiceCapabilitiesLoaded = false;
 let voiceCapabilitiesPromise = null;
+let gnaniLastError = '';
 let voiceSpaceHeld = false;
 let voiceSpaceReleasedWhileStarting = false;
 let voicePointerTimer = null;
@@ -111,14 +119,20 @@ const COMMAND_FILLER_WORDS = new Set([
   'udhaar', 'udhar', 'credit', 'debit', 'jama', 'mile', 'mila', 'likho', 'likh', 'entry', 'received',
   'payment', 'paid', 'vasool', 'add', 'record', 'aaj', 'today', 'hai', 'hain', 'tha', 'the', 'name', 'customer', 'kiye', 'kiya', 'diya', 'diye', 'liya', 'liye', 'kar', 'karo',
   'रुपये', 'रुपए', 'रुपया', 'रुपयों', 'पैसे', 'पैसा', 'पैसों', 'लिखो', 'लिख', 'जमा', 'उधार', 'उधर', 'उधारी', 'जी', 'ji',
-  'मिले', 'मिला', 'किए', 'किया', 'दिए', 'दिया', 'लिए', 'लिया', 'कर', 'करो', 'हुआ', 'हुई', 'आज', 'है', 'हैं', 'थे', 'था', 'का', 'के', 'को', 'ने', 'से', 'पर', 'नाम', 'ग्राहक',
+  'मिले', 'मिला', 'किए', 'किया', 'दिए', 'दिया', 'लिए', 'लिया', 'कर', 'करो', 'हुआ', 'हुए', 'हुई', 'हुईं', 'आज', 'है', 'हैं', 'थे', 'था', 'थी', 'हो', 'का', 'के', 'को', 'ने', 'से', 'पर', 'नाम', 'ग्राहक',
 ]);
 function commandCustomerName(value) {
-  return [...String(value || '').normalize('NFC').matchAll(/[\p{L}\p{M}]+/gu)]
+  const name = [...String(value || '').normalize('NFC').matchAll(/[\p{L}\p{M}]+/gu)]
     .map((match) => match[0])
     .filter((word) => !COMMAND_FILLER_WORDS.has(word.toLocaleLowerCase('en-IN')))
     .join(' ')
     .trim();
+  if (!/[\u0900-\u097f]/u.test(name)) return name;
+  return customerNameMatchKey(name).replace(/(^|[\s-])(\p{L})/gu, (_, separator, letter) => `${separator}${letter.toUpperCase()}`);
+}
+function displayCustomerName(value) {
+  const name = String(value || '').normalize('NFC').trim();
+  return /[\u0900-\u097f]/u.test(name) ? (commandCustomerName(name) || name) : name;
 }
 function namesOneEditApart(left, right) {
   const a = Array.from(customerNameMatchKey(left));
@@ -146,44 +160,84 @@ function toast(message) {
   toast.timer = setTimeout(() => element.classList.remove('show'), 3200);
 }
 
-function speakText(message) {
-  if (gnaniTtsEnabled) return speakWithGnani(message).then((played) => played || speakWithBrowser(message));
-  return speakWithBrowser(message);
+let gnaniTtsWarningShown = false;
+let geminiQuestionWarningShown = false;
+async function speakText(message) {
+  if (!voiceCapabilitiesLoaded) await requestVoiceCapabilities();
+  if (!gnaniTtsEnabled) {
+    if (!gnaniTtsWarningShown) {
+      gnaniTtsWarningShown = true;
+      toast(gnaniLastError || 'Gnani speech output is not enabled on the backend.');
+    }
+    return false;
+  }
+  const played = await speakWithGnani(message);
+  if (played) return true;
+  if (!gnaniTtsWarningShown) {
+    gnaniTtsWarningShown = true;
+    toast(gnaniLastError || 'Gnani voice response failed.');
+  }
+  return false;
 }
-function speakWithBrowser(message) {
-  if (!('speechSynthesis' in window) || !window.SpeechSynthesisUtterance) return Promise.resolve(false);
-  return new Promise((resolve) => {
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(message);
-    utterance.lang = voiceLanguage;
-    utterance.rate = 0.95;
-    utterance.volume = 1;
-    const voices = window.speechSynthesis.getVoices();
-    const language = voiceLanguage.toLowerCase().split('-')[0];
-    utterance.voice = voices.find((voice) => voice.lang.toLowerCase().startsWith(`${language}-`)) || null;
-    let finished = false;
-    const finish = (played) => {
-      if (finished) return;
-      finished = true;
-      resolve(played);
-    };
-    utterance.onend = () => finish(true);
-    utterance.onerror = () => finish(false);
-    try { window.speechSynthesis.speak(utterance); }
-    catch { finish(false); }
+function isHandsFreeVoiceSession() {
+  try { return Boolean(window.VoiceKhataNative?.isHandsFreeSession?.()); }
+  catch { return false; }
+}
+function updateHandsFreeStatus(message) {
+  try { if (isHandsFreeVoiceSession()) window.VoiceKhataNative.setHandsFreeStatus(message); } catch {}
+}
+function finishHandsFreeAfterSpeech(message) {
+  updateHandsFreeStatus(message);
+  window.__voiceKhataHandsFreeSpeechActive = true;
+  const speech = speakText(message);
+  Promise.resolve(speech).finally(() => {
+    window.__voiceKhataHandsFreeSpeechActive = false;
+    if (isHandsFreeVoiceSession()) window.VoiceKhataNative.finishHandsFreeSession();
   });
 }
-
+function retryHandsFreeCapture(message) {
+  updateHandsFreeStatus(message);
+  speakText(message).then((played) => {
+    if (isHandsFreeVoiceSession() && played) window.VoiceKhataNative.startCapture();
+    else if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession('Gnani se awaaz nahi chal paayi. Kuch save nahi hua.');
+  });
+}
+function retryHandsFreeQuestion(entry, prompt, onAnswer) {
+  speakText('जवाब नहीं सुना। फिर बोलें।').then((played) => {
+    if (isHandsFreeVoiceSession() && played) askConversationQuestion(entry, prompt, onAnswer);
+    else if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession();
+  });
+}
+function failHandsFreeVoiceSession(message = 'माफ़ कीजिए, आवाज़ समझ नहीं आई। कुछ सेव नहीं हुआ। दोबारा शुरू करने के लिए assistant button दबाएँ।') {
+  stopVoiceReply();
+  const sessionId = pendingVoiceEntry?.sessionId || voiceConversation?.entry?.sessionId;
+  if (sessionId) cancelVoiceSession(sessionId);
+  pendingVoiceEntry = null;
+  voiceConversation = null;
+  setVoiceReady('Nothing was saved. Start again by pressing the assistant button.');
+  finishHandsFreeAfterSpeech(message);
+}
 function setAuthError(message = '') {
   const error = $('#auth-error');
-  error.textContent = message;
-  error.hidden = !message;
+  if (error) {
+    error.textContent = message;
+    error.hidden = !message;
+  }
+  if (message) setAuthInfo('');
+}
+
+function setAuthInfo(message = '') {
+  const info = $('#auth-info');
+  if (info) {
+    info.textContent = message;
+    info.hidden = !message;
+  }
 }
 
 function showAuth(message = '') {
+  $('#startup-screen').hidden = true;
   if (listening) stopListening();
   stopVoiceReply();
-  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   $$('dialog[open]').forEach((dialog) => dialog.close());
   pendingVoiceEntry = null;
   voiceConversation = null;
@@ -194,6 +248,7 @@ function showAuth(message = '') {
 }
 
 function showApp() {
+  $('#startup-screen').hidden = true;
   $('#auth-screen').hidden = true;
   $('#app-shell').hidden = false;
 }
@@ -240,9 +295,14 @@ function requestVoiceCapabilities() {
       gnaniSttEnabled = Boolean(capabilities.speech_to_text);
       gnaniTtsEnabled = Boolean(capabilities.speech_output);
       voiceCapabilitiesLoaded = true;
+      gnaniLastError = gnaniTtsEnabled ? '' : 'Gnani speech is not configured on the backend.';
+      if (gnaniTtsEnabled) gnaniTtsWarningShown = false;
       return capabilities;
     })
-    .catch(() => null)
+    .catch(() => {
+      gnaniLastError = 'Could not check Gnani services. Check the backend connection.';
+      return null;
+    })
     .finally(() => { voiceCapabilitiesPromise = null; });
   return voiceCapabilitiesPromise;
 }
@@ -359,7 +419,10 @@ function assembleGnaniPcmWav(chunks) {
   return new Blob([output], { type: 'audio/wav' });
 }
 async function speakWithGnani(message) {
-  if (!token || !API_BASE) return false;
+  if (!token || !API_BASE) {
+    gnaniLastError = 'Log in again before using the Gnani voice response.';
+    return false;
+  }
   try {
     const response = await fetch(`${API_BASE}/api/v1/voice/speak`, {
       method: 'POST',
@@ -367,11 +430,19 @@ async function speakWithGnani(message) {
       body: JSON.stringify({ text: message, language_code: voiceLanguage }),
       cache: 'no-store',
     });
-    if (!response.ok) return false;
+    if (!response.ok) {
+      let detail = '';
+      try { detail = (await response.json())?.detail || ''; } catch {}
+      gnaniLastError = detail || `Gnani speech request failed (${response.status}).`;
+      return false;
+    }
     const stream = await response.text();
     const audioChunks = decodeGnaniTtsSse(stream);
     const wav = assembleWav(audioChunks) || assembleGnaniPcmWav(audioChunks);
-    if (!wav) return false;
+    if (!wav) {
+      gnaniLastError = 'Gnani returned no playable audio. Check the configured voice and TTS format.';
+      return false;
+    }
     const url = URL.createObjectURL(wav);
     try {
       const audio = new Audio(url);
@@ -381,23 +452,107 @@ async function speakWithGnani(message) {
         audio.play().catch(reject);
       });
     } finally { URL.revokeObjectURL(url); }
+    gnaniLastError = '';
     return true;
-  } catch {
+  } catch (error) {
+    gnaniLastError = error?.name === 'NotAllowedError'
+      ? 'The browser blocked audio playback. Tap the page once and try again.'
+      : (error?.message || 'Could not reach Gnani speech output.');
     return false;
   }
 }
 
 function setAuthMode(mode) {
-  const registering = mode === 'register';
-  $('#login-form').hidden = registering;
-  $('#register-form').hidden = !registering;
-  $('#auth-title').textContent = registering ? 'Set up your shop' : 'Welcome back';
-  $('#auth-subtitle').textContent = registering ? 'Set up your shop once. Later, sign in with your email and password.' : 'Sign in to see your customers and khata.';
-  $('#auth-toggle').textContent = registering ? 'Already have an account? Log in' : 'New here? Create an account';
+  const isLogin = mode === 'login';
+  const isRegister = mode === 'register';
+  const isForgot = mode === 'forgot';
+
+  const loginForm = $('#login-form');
+  const registerForm = $('#register-form');
+  const forgotForm = $('#forgot-form');
+  const authToggle = $('#auth-toggle');
+
+  if (loginForm) loginForm.hidden = !isLogin;
+  if (registerForm) registerForm.hidden = !isRegister;
+  if (forgotForm) forgotForm.hidden = !isForgot;
+
+  if (isLogin) {
+    $('#auth-title').textContent = 'Welcome back';
+    $('#auth-subtitle').textContent = 'Sign in with your Gmail and password.';
+    if (authToggle) {
+      authToggle.hidden = false;
+      authToggle.textContent = 'New here? Create an account';
+    }
+  } else if (isRegister) {
+    $('#auth-title').textContent = 'Set up your shop';
+    $('#auth-subtitle').textContent = 'Enter your Gmail address. We will verify with OTP.';
+    if (authToggle) {
+      authToggle.hidden = false;
+      authToggle.textContent = 'Already have an account? Log in';
+    }
+  } else if (isForgot) {
+    $('#auth-title').textContent = 'Reset Password';
+    $('#auth-subtitle').textContent = 'Enter your registered Gmail to receive an OTP.';
+    if (authToggle) authToggle.hidden = true;
+  }
+
   setAuthError('');
+  setAuthInfo('');
 }
 
-async function authenticate(path, payload) {
+function startOtpCooldown(button, cooldownSeconds = 30) {
+  let remaining = cooldownSeconds;
+  button.disabled = true;
+  const originalText = button.textContent;
+  button.textContent = `Resend in ${remaining}s`;
+
+  const interval = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(interval);
+      button.disabled = false;
+      button.textContent = 'Resend OTP';
+    } else {
+      button.textContent = `Resend in ${remaining}s`;
+    }
+  }, 1000);
+}
+
+async function handleSendOtp(targetInputId, buttonId, otpSectionId, otpInputId, purpose) {
+  const target = $(targetInputId).value.trim();
+  if (!target) {
+    setAuthError('Please enter your Gmail address first.');
+    return;
+  }
+  const button = $(buttonId);
+  setAuthError('');
+  setAuthInfo('Sending verification OTP…');
+  button.disabled = true;
+
+  try {
+    const result = await api('/api/v1/auth/otp/send', {
+      method: 'POST',
+      body: JSON.stringify({ target, purpose }),
+    });
+
+    $(otpSectionId).hidden = false;
+    let message = result.message || 'OTP sent successfully!';
+    if (result.dev_otp) {
+      message = `OTP sent! (Test OTP: ${result.dev_otp})`;
+      const otpInput = $(otpInputId);
+      if (otpInput && !otpInput.value) {
+        otpInput.value = result.dev_otp;
+      }
+    }
+    setAuthInfo(message);
+    startOtpCooldown(button, result.cooldown_seconds || 30);
+  } catch (error) {
+    setAuthError(error.message);
+    button.disabled = false;
+  }
+}
+
+async function authenticate(path, payload, successToast = 'You are logged in') {
   try {
     const result = await api(path, { method: 'POST', body: JSON.stringify(payload) });
     token = result.access_token;
@@ -408,30 +563,106 @@ async function authenticate(path, payload) {
     renderAll();
     void requestVoiceCapabilities();
     startAssistantVoiceWhenReady();
-    toast(path.endsWith('/register') ? 'Shop account created' : 'You are logged in');
+    toast(successToast);
   } catch (error) {
     setAuthError(error.message);
   }
 }
 
+// Send OTP click handlers
+const registerSendOtpBtn = $('#register-send-otp-btn');
+if (registerSendOtpBtn) {
+  registerSendOtpBtn.addEventListener('click', () => {
+    handleSendOtp('#register-target', '#register-send-otp-btn', '#register-otp-section', '#register-otp', 'registration');
+  });
+}
+
+const forgotSendOtpBtn = $('#forgot-send-otp-btn');
+if (forgotSendOtpBtn) {
+  forgotSendOtpBtn.addEventListener('click', () => {
+    handleSendOtp('#forgot-target', '#forgot-send-otp-btn', '#forgot-otp-section', '#forgot-otp', 'reset_password');
+  });
+}
+
+// Navigation between forms
+const forgotPasswordLink = $('#forgot-password-link');
+if (forgotPasswordLink) {
+  forgotPasswordLink.addEventListener('click', () => setAuthMode('forgot'));
+}
+
+const forgotBackBtn = $('#forgot-back-btn');
+if (forgotBackBtn) {
+  forgotBackBtn.addEventListener('click', () => setAuthMode('login'));
+}
+
+// Submit handlers
 $('#login-form').addEventListener('submit', (event) => {
   event.preventDefault();
+  const identifier = ($('#login-identifier') ? $('#login-identifier').value : $('#login-email').value).trim();
+  const password = $('#login-password').value;
   authenticate('/api/v1/auth/login', {
-    email: $('#login-email').value.trim(),
-    password: $('#login-password').value,
-  });
+    identifier,
+    password,
+  }, 'You are logged in');
 });
+
 $('#register-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  authenticate('/api/v1/auth/register', {
-    name: $('#register-name').value.trim(),
-    owner_name: $('#register-owner-name').value.trim() || null,
-    location: $('#register-location').value.trim() || null,
-    email: $('#register-email').value.trim(),
-    password: $('#register-password').value,
-  });
+  const target = $('#register-target').value.trim();
+  const otp = $('#register-otp').value.trim();
+  const password = $('#register-password').value;
+  const name = $('#register-name').value.trim();
+  const owner_name = $('#register-owner-name').value.trim() || null;
+  const location = $('#register-location').value.trim() || null;
+
+  if (!otp || otp.length < 4) {
+    setAuthError('Please enter the 6-digit OTP sent to your Gmail.');
+    return;
+  }
+  if (!password || password.length < 10) {
+    setAuthError('Password must be at least 10 characters long.');
+    return;
+  }
+
+  authenticate('/api/v1/auth/otp/register', {
+    target,
+    otp,
+    password,
+    name,
+    owner_name,
+    location,
+  }, 'Shop account created and password set!');
 });
-$('#auth-toggle').addEventListener('click', () => setAuthMode($('#register-form').hidden ? 'register' : 'login'));
+
+const forgotForm = $('#forgot-form');
+if (forgotForm) {
+  forgotForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const target = $('#forgot-target').value.trim();
+    const otp = $('#forgot-otp').value.trim();
+    const new_password = $('#forgot-password').value;
+
+    if (!otp || otp.length < 4) {
+      setAuthError('Please enter the 6-digit OTP code.');
+      return;
+    }
+    if (!new_password || new_password.length < 10) {
+      setAuthError('New password must be at least 10 characters long.');
+      return;
+    }
+
+    authenticate('/api/v1/auth/otp/reset-password', {
+      target,
+      otp,
+      new_password,
+    }, 'Password reset successfully! You are logged in.');
+  });
+}
+
+$('#auth-toggle').addEventListener('click', () => {
+  const registerForm = $('#register-form');
+  setAuthMode(registerForm && !registerForm.hidden ? 'login' : 'register');
+});
 $('#logout-btn').addEventListener('click', () => {
   token = '';
   merchant = null;
@@ -445,20 +676,32 @@ $('#logout-btn').addEventListener('click', () => {
 });
 
 async function loadWorkspace() {
-  const [me, remoteCustomers, remoteEntries] = await Promise.all([
+  const [me, remoteCustomers, entriesResult] = await Promise.all([
     api('/api/v1/auth/me'),
     api('/api/v1/customers'),
-    loadAllEntries(),
+    loadAllEntries().then((entries) => ({ entries })).catch((error) => ({ error })),
   ]);
+  const remoteEntries = entriesResult.entries ?? null;
+  if (remoteEntries !== null) {
+    workspaceLoadError = '';
+  } else {
+    const error = entriesResult.error;
+    // Authentication and customer data should remain usable when a ledger page
+    // is temporarily malformed/unavailable, but never pretend history loaded.
+    workspaceLoadError = error.message || 'Ledger history could not be loaded. Retry before recording an entry.';
+  }
   merchant = me;
-  transactions = remoteEntries.map((entry) => ({
-    id: entry.id,
-    customerId: entry.customer_id,
-    amount: Number(entry.amount),
-    type: entry.entry_type === 'udhaar' ? 'credit' : 'payment',
-    note: entry.note || '',
-    createdAt: entry.created_at,
-  }));
+  if (remoteEntries) {
+    transactions = remoteEntries.map((entry) => ({
+      id: entry.id,
+      customerId: entry.customer_id,
+      amount: Number(entry.amount),
+      type: entry.entry_type === 'udhaar' ? 'credit' : 'payment',
+      note: entry.note || '',
+      createdAt: entry.created_at,
+      transactionDate: entry.transaction_date || entry.created_at,
+    }));
+  }
   const activityByCustomer = new Map();
   for (const entry of transactions) {
     const current = activityByCustomer.get(entry.customerId);
@@ -467,6 +710,7 @@ async function loadWorkspace() {
   customers = remoteCustomers.map((customer) => ({
     id: customer.id,
     name: customer.name,
+    displayName: displayCustomerName(customer.name),
     phone: customer.phone || '',
     balance: Number(customer.balance),
     lastActivity: activityByCustomer.get(customer.id) || null,
@@ -475,18 +719,50 @@ async function loadWorkspace() {
     shopName: me.name,
     ownerName: me.owner_name || '',
     location: me.location || '',
+    upiId: me.upi_id || '',
   };
 }
 
 async function loadAllEntries() {
-  const pageSize = 500;
+  const pageSize = 1000;
   const all = [];
   for (let offset = 0; ; offset += pageSize) {
-    const page = await api(`/api/v1/ledger/entries?limit=${pageSize}&offset=${offset}`);
+    let page;
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        page = await api(`/api/v1/ledger/entries?limit=${pageSize}&offset=${offset}`);
+        if (!Array.isArray(page)) throw new Error('The backend returned an invalid ledger page. Please retry loading your khata.');
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (error.status === 401 || attempt === 2) break;
+        await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+      }
+    }
+    if (lastError) throw lastError;
     all.push(...page);
     if (page.length < pageSize) return all;
   }
 }
+
+$('#retry-workspace-load').addEventListener('click', async () => {
+  if (retryingWorkspaceLoad) return;
+  retryingWorkspaceLoad = true;
+  $('#retry-workspace-load').disabled = true;
+  try {
+    await loadWorkspace();
+    renderAll();
+    if (!workspaceLoadError) toast('Your khata history is up to date.');
+  } catch (error) {
+    workspaceLoadError = error.message || 'Could not reload your khata. Check your connection and retry.';
+    renderAll();
+  } finally {
+    retryingWorkspaceLoad = false;
+    $('#retry-workspace-load').disabled = false;
+  }
+});
 
 function balanceOf(customerId) {
   return Number(customers.find((customer) => customer.id === customerId)?.balance || 0);
@@ -515,11 +791,23 @@ function renderProfile() {
   $('#shop-name-input').value = name;
   $('#owner-name-input').value = profile.ownerName || '';
   $('#shop-location-input').value = profile.location || '';
+  $('#shop-upi-id-input').value = profile.upiId || '';
 }
 function renderDate() {
   const now = new Date();
   $('#today-label').textContent = now.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).toUpperCase();
   $('#today-date').textContent = now.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+  now.setHours(0, 0, 0, 0);
+  if (!chartEndDate) chartEndDate = dateKey(now);
+  if (!chartStartDate) {
+    const firstDay = new Date(now);
+    firstDay.setDate(firstDay.getDate() - 6);
+    chartStartDate = dateKey(firstDay);
+  }
+  $('#chart-start-date').max = dateKey(now);
+  $('#chart-end-date').max = dateKey(now);
+  $('#chart-start-date').value = chartStartDate;
+  $('#chart-end-date').value = chartEndDate;
 }
 function renderActivity() {
   const list = $('#activity-list');
@@ -529,7 +817,7 @@ function renderActivity() {
     list.querySelector('[data-open-entry]').addEventListener('click', () => openEntry());
     return;
   }
-  list.innerHTML = items.map((entry) => `<div class="activity-row"><span class="activity-symbol ${entry.type}">${entry.type === 'credit' ? '↗' : '↙'}</span><div class="activity-person"><b>${esc(customerName(entry.customerId))}</b><small>${esc(displayTime(entry.createdAt))} · ${entry.type === 'credit' ? 'Udhaar' : 'Payment'}${entry.note ? ` · ${esc(entry.note)}` : ''}</small></div><div class="activity-amount ${entry.type}">${entry.type === 'credit' ? '+' : '−'}${money(entry.amount)}<small>${entry.type === 'credit' ? 'Added' : 'Received'}</small></div></div>`).join('');
+  list.innerHTML = items.map((entry) => `<div class="activity-row"><span class="activity-symbol ${entry.type}">${entry.type === 'credit' ? '↗' : '↙'}</span><div class="activity-person"><b>${esc(displayCustomerName(customerName(entry.customerId)))}</b><small>${esc(displayTime(entry.createdAt))} · ${entry.type === 'credit' ? 'Udhaar' : 'Payment'}${entry.note ? ` · ${esc(entry.note)}` : ''}</small></div><div class="activity-amount ${entry.type}">${entry.type === 'credit' ? '+' : '−'}${money(entry.amount)}<small>${entry.type === 'credit' ? 'Added' : 'Received'}</small></div></div>`).join('');
 }
 function renderHomeCustomers() {
   const element = $('#home-customers');
@@ -539,13 +827,13 @@ function renderHomeCustomers() {
     element.querySelector('[data-add-home-customer]').addEventListener('click', openCustomer);
     return;
   }
-  element.innerHTML = owing.length ? owing.map((customer) => `<button type="button" class="customer-mini" data-customer-id="${esc(customer.id)}" aria-label="View ${esc(customer.name)} history"><span class="customer-initial">${esc(initials(customer.name))}</span><span class="customer-mini-info"><b>${esc(customer.name)}</b><small>Outstanding</small></span><span class="customer-balance">${money(customer.balance)}</span></button>`).join('') : '<div class="empty-state"><b>All caught up</b><span>No customer has an outstanding balance.</span></div>';
+  element.innerHTML = owing.length ? owing.map((customer) => `<button type="button" class="customer-mini" data-customer-id="${esc(customer.id)}" aria-label="View ${esc(customer.displayName)} history"><span class="customer-initial">${esc(initials(customer.displayName))}</span><span class="customer-mini-info"><b>${esc(customer.displayName)}</b><small>Outstanding</small></span><span class="customer-balance">${money(customer.balance)}</span></button>`).join('') : '<div class="empty-state"><b>All caught up</b><span>No customer has an outstanding balance.</span></div>';
 }
 function renderCustomers() {
   const query = ($('#customer-search').value || '').trim().toLowerCase();
   const filter = $('#balance-filter').value;
   const rows = customers.map((customer) => ({ ...customer, balance: balanceOf(customer.id) }))
-    .filter((customer) => `${customer.name} ${customer.phone}`.toLowerCase().includes(query))
+    .filter((customer) => `${customer.name} ${customer.displayName} ${customer.phone}`.toLowerCase().includes(query))
     .filter((customer) => filter === 'owing' ? customer.balance > 0 : filter === 'settled' ? customer.balance === 0 : filter === 'advance' ? customer.balance < 0 : true)
     .sort((a, b) => a.name.localeCompare(b.name));
   $('#customer-count').textContent = `${rows.length} ${rows.length === 1 ? 'customer' : 'customers'}`;
@@ -554,7 +842,23 @@ function renderCustomers() {
     body.innerHTML = customers.length ? '<tr><td colspan="6" class="table-empty">No customers match that search.</td></tr>' : '<tr><td colspan="6" class="table-empty">Your customer list is empty. Add a customer to start a khata.</td></tr>';
     return;
   }
-  body.innerHTML = rows.map((customer) => `<tr class="customer-clickable-row" data-customer-id="${esc(customer.id)}" tabindex="0" role="button" aria-label="View ${esc(customer.name)} history"><td><span class="table-person"><span class="customer-initial">${esc(initials(customer.name))}</span>${esc(customer.name)}</span></td><td>${esc(customer.phone || '—')}</td><td>${esc(displayTime(customer.lastActivity))}</td><td><b>${money(Math.max(0, customer.balance))}</b>${customer.balance < 0 ? `<small class="advance-note"> · Advance ${money(-customer.balance)}</small>` : ''}</td><td><span class="status-badge ${customer.balance <= 0 ? 'settled' : ''}">${customer.balance > 0 ? 'Outstanding' : customer.balance < 0 ? 'Advance' : 'Settled'}</span></td><td><span class="row-open-label">View history →</span></td></tr>`).join('');
+  body.innerHTML = rows.map((customer) => `<tr class="customer-clickable-row" data-customer-id="${esc(customer.id)}"><td><span class="table-person"><span class="customer-initial">${esc(initials(customer.displayName))}</span>${esc(customer.displayName)}</span></td><td>${esc(customer.phone || '—')}</td><td>${esc(displayTime(customer.lastActivity))}</td><td><b>${money(Math.max(0, customer.balance))}</b>${customer.balance < 0 ? `<small class="advance-note"> · Advance ${money(-customer.balance)}</small>` : ''}</td><td><span class="status-badge ${customer.balance <= 0 ? 'settled' : ''}">${customer.balance > 0 ? 'Outstanding' : customer.balance < 0 ? 'Advance' : 'Settled'}</span></td><td><div class="customer-row-actions"><button type="button" class="row-history-button" data-view-customer="${esc(customer.id)}">View history →</button><button type="button" class="customer-delete-button" data-delete-customer="${esc(customer.id)}" aria-label="Delete ${esc(customer.displayName)}" title="Delete customer">Delete</button></div></td></tr>`).join('');
+}
+async function deleteCustomer(customerId) {
+  const customer = customers.find((item) => item.id === customerId);
+  if (!customer) return;
+  if (!window.confirm(`Delete ${customer.displayName || displayCustomerName(customer.name)}? This permanently removes the customer and all of their ledger history.`)) return;
+  const button = $(`[data-delete-customer="${CSS.escape(customerId)}"]`);
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/v1/customers/${encodeURIComponent(customerId)}`, { method: 'DELETE' });
+    await loadWorkspace();
+    renderAll();
+    toast(`${customer.displayName || displayCustomerName(customer.name)} and their ledger history were deleted.`);
+  } catch (error) {
+    if (button) button.disabled = false;
+    toast(error.message || 'Could not delete this customer.');
+  }
 }
 function openCustomerDetail(customerId) {
   if (!customers.some((customer) => customer.id === customerId)) return;
@@ -597,7 +901,7 @@ function renderCustomerDetail() {
   const currentBalance = Number(data?.balance ?? customer.balance);
   const creditTotal = sums(entries, 'credit');
   const paymentTotal = sums(entries, 'payment');
-  $('#customer-detail-name').textContent = customer.name;
+  $('#customer-detail-name').textContent = displayCustomerName(customer.name);
   $('#customer-detail-contact').textContent = [customer.phone || 'No phone number', customer.lastActivity ? `Last activity ${displayTime(customer.lastActivity)}` : 'No activity yet'].join(' · ');
   $('#customer-detail-balance').textContent = currentBalance < 0 ? `${money(-currentBalance)} advance` : money(currentBalance);
   $('#customer-detail-credit').textContent = money(creditTotal);
@@ -624,12 +928,16 @@ function renderCustomerDetail() {
 }
 function renderTransactions() {
   const body = $('#transaction-rows');
-  const items = [...transactions].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const today = dateKey(new Date());
+  const viewItems = transactions.filter((entry) => ledgerView === 'payments-today' ? dateKey(entry.createdAt) === today && entry.type === 'payment' : ledgerView === 'entries-today' ? dateKey(entry.createdAt) === today : true);
+  const items = [...viewItems].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  $('#ledger-view-label').textContent = ledgerView === 'payments-today' ? 'Payments received today' : ledgerView === 'entries-today' ? 'All entries recorded today' : 'All recorded transactions';
+  $('#ledger-view-reset').hidden = ledgerView === 'all';
   if (!items.length) {
-    body.innerHTML = '<tr><td colspan="5" class="table-empty">Transactions you record will appear here.</td></tr>';
+    body.innerHTML = `<tr><td colspan="5" class="table-empty">${ledgerView === 'all' ? 'Transactions you record will appear here.' : 'No matching entries for this view.'}</td></tr>`;
     return;
   }
-  body.innerHTML = items.map((entry) => `<tr><td>${esc(new Date(entry.createdAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }))}</td><td>${esc(customerName(entry.customerId))}</td><td>${esc(entry.note || '—')}</td><td><span class="status-badge ${entry.type === 'payment' ? 'settled' : ''}">${entry.type === 'credit' ? 'Udhaar' : 'Payment'}</span></td><td><b>${entry.type === 'credit' ? '+' : '−'}${money(entry.amount)}</b></td></tr>`).join('');
+  body.innerHTML = items.map((entry) => `<tr><td>${esc(new Date(entry.createdAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }))}</td><td>${esc(displayCustomerName(customerName(entry.customerId)))}</td><td>${esc(entry.note || '—')}</td><td><span class="status-badge ${entry.type === 'payment' ? 'settled' : ''}">${entry.type === 'credit' ? 'Udhaar' : 'Payment'}</span></td><td><b>${entry.type === 'credit' ? '+' : '−'}${money(entry.amount)}</b></td></tr>`).join('');
 }
 function sums(items, type) {
   return items.filter((entry) => !type || entry.type === type).reduce((sum, entry) => sum + Number(entry.amount), 0);
@@ -653,18 +961,63 @@ function renderSummary() {
 function renderWeeklyChart() {
   const root = $('#weekly-chart');
   const days = [];
-  for (let offset = 6; offset >= 0; offset -= 1) {
-    const day = new Date();
-    day.setHours(0, 0, 0, 0);
-    day.setDate(day.getDate() - offset);
+  const firstDay = new Date(`${chartStartDate}T12:00:00`);
+  const lastDay = new Date(`${chartEndDate}T12:00:00`);
+  const sevenDayStart = new Date(lastDay);
+  sevenDayStart.setDate(sevenDayStart.getDate() - 6);
+  const showWeekdayLabels = dateKey(firstDay) === dateKey(sevenDayStart) && dateKey(lastDay) === dateKey(new Date());
+  for (const day = new Date(firstDay); day <= lastDay; day.setDate(day.getDate() + 1)) {
     const key = dateKey(day);
-    const entries = transactions.filter((entry) => dateKey(entry.createdAt) === key);
-    days.push({ label: day.toLocaleDateString('en-IN', { weekday: 'short' }), credit: sums(entries, 'credit'), payment: sums(entries, 'payment') });
+    const entries = transactions.filter((entry) => dateKey(entry.transactionDate || entry.createdAt) === key);
+    days.push({
+      label: showWeekdayLabels
+        ? day.toLocaleDateString('en-IN', { weekday: 'short' })
+        : day.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }),
+      title: day.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' }),
+      credit: sums(entries, 'credit'), payment: sums(entries, 'payment'),
+    });
   }
+  const dateFormat = { day: 'numeric', month: 'short', year: 'numeric' };
+  const rangeText = `${firstDay.toLocaleDateString('en-IN', dateFormat)} – ${lastDay.toLocaleDateString('en-IN', dateFormat)}`;
+  $('#chart-range-label').textContent = showWeekdayLabels
+    ? 'LAST 7 DAYS'
+    : rangeText.toUpperCase();
   const max = Math.max(1, ...days.flatMap((day) => [day.credit, day.payment]));
-  root.innerHTML = days.map((day) => `<div class="week-day" title="${esc(day.label)} · Credit ${money(day.credit)} · Payment ${money(day.payment)}"><div class="week-bars"><span class="week-credit" style="height:${Math.max(day.credit ? 5 : 0, day.credit / max * 100)}%"></span><span class="week-payment" style="height:${Math.max(day.payment ? 5 : 0, day.payment / max * 100)}%"></span></div><small>${esc(day.label)}</small></div>`).join('');
+  root.style.setProperty('--chart-day-count', String(days.length));
+  root.style.minWidth = days.length > 7 ? `${days.length * 38}px` : '100%';
+  root.innerHTML = days.map((day) => `<div class="week-day" title="${esc(day.title)} · Credit ${money(day.credit)} · Payment ${money(day.payment)}"><div class="week-bars"><span class="week-credit" style="height:${Math.max(day.credit ? 5 : 0, day.credit / max * 100)}%"></span><span class="week-payment" style="height:${Math.max(day.payment ? 5 : 0, day.payment / max * 100)}%"></span></div><small>${esc(day.label)}</small></div>`).join('');
 }
+$('#chart-date-filter').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const start = $('#chart-start-date').value;
+  const end = $('#chart-end-date').value;
+  if (!start || !end || start > end) { toast('Choose a valid date range.'); return; }
+  const startDate = new Date(`${start}T12:00:00`);
+  const endDate = new Date(`${end}T12:00:00`);
+  const dayCount = Math.round((endDate - startDate) / 86400000) + 1;
+  if (dayCount > 366) { toast('Choose a range of up to one year.'); return; }
+  chartStartDate = start;
+  chartEndDate = end;
+  renderWeeklyChart();
+});
+$('#chart-reset-date').addEventListener('click', () => {
+  const end = new Date();
+  end.setHours(0, 0, 0, 0);
+  const start = new Date(end);
+  start.setDate(start.getDate() - 6);
+  chartStartDate = dateKey(start);
+  chartEndDate = dateKey(end);
+  $('#chart-start-date').value = chartStartDate;
+  $('#chart-end-date').value = chartEndDate;
+  renderWeeklyChart();
+});
 function renderAll() {
+  const warning = $('#workspace-load-warning');
+  warning.hidden = !workspaceLoadError;
+  $('#workspace-load-message').textContent = workspaceLoadError
+    ? `${workspaceLoadError} New entries are disabled until the history loads.`
+    : '';
+  $('#retry-workspace-load').disabled = retryingWorkspaceLoad;
   renderProfile();
   renderDate();
   renderActivity();
@@ -678,25 +1031,39 @@ function go(page) {
   $$('.page').forEach((element) => element.classList.toggle('active', element.id === `page-${page}`));
   const navPage = page === 'customer' ? 'khata' : page;
   $$('[data-page]').forEach((button) => button.classList.toggle('active', button.dataset.page === navPage));
-  $('#crumb-page').textContent = page === 'customer' ? 'Customer history' : page === 'khata' ? 'Digital khata' : page === 'analytics' ? 'Analytics' : 'Overview';
+  const crumbPage = $('#crumb-page');
+  if (crumbPage) crumbPage.textContent = page === 'customer' ? 'Customer history' : page === 'khata' ? 'Digital khata' : page === 'analytics' ? 'Analytics' : page === 'profile' ? 'Profile' : 'Overview';
   if (page === 'khata') renderCustomers();
   if (page === 'customer') renderCustomerDetail();
   if (page === 'analytics') renderSummary();
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
-$$('[data-page]').forEach((button) => button.addEventListener('click', () => go(button.dataset.page)));
+$$('[data-page]:not(.profile-nav-link)').forEach((button) => button.addEventListener('click', () => go(button.dataset.page)));
+$$('[data-metric-view]').forEach((button) => button.addEventListener('click', () => {
+  const view = button.dataset.metricView;
+  $('#customer-search').value = '';
+  if (view === 'outstanding') { $('#balance-filter').value = 'owing'; ledgerView = 'all'; }
+  else { $('#balance-filter').value = 'all'; ledgerView = view; }
+  go('khata');
+  if (view !== 'outstanding') requestAnimationFrame(() => $('.transactions-section').scrollIntoView({ behavior: 'smooth', block: 'start' }));
+}));
+$('#ledger-view-reset').addEventListener('click', () => { ledgerView = 'all'; renderTransactions(); });
 $$('[data-goto]').forEach((button) => button.addEventListener('click', () => go(button.dataset.goto)));
 $$('[data-open-entry]').forEach((button) => button.addEventListener('click', () => openEntry()));
 $('#customer-rows').addEventListener('click', (event) => {
+  const historyButton = event.target.closest('[data-view-customer]');
+  if (historyButton) {
+    openCustomerDetail(historyButton.dataset.viewCustomer);
+    return;
+  }
+  const deleteButton = event.target.closest('[data-delete-customer]');
+  if (deleteButton) {
+    event.stopPropagation();
+    deleteCustomer(deleteButton.dataset.deleteCustomer);
+    return;
+  }
   const row = event.target.closest('tr[data-customer-id]');
   if (row) openCustomerDetail(row.dataset.customerId);
-});
-$('#customer-rows').addEventListener('keydown', (event) => {
-  const row = event.target.closest('tr[data-customer-id]');
-  if (row && (event.key === 'Enter' || event.key === ' ')) {
-    event.preventDefault();
-    openCustomerDetail(row.dataset.customerId);
-  }
 });
 $('#home-customers').addEventListener('click', (event) => {
   const customerButton = event.target.closest('[data-customer-id]');
@@ -704,6 +1071,28 @@ $('#home-customers').addEventListener('click', (event) => {
 });
 $('#customer-back').addEventListener('click', () => go('khata'));
 $('#customer-detail-new-entry').addEventListener('click', () => openEntry(selectedCustomerId));
+$('#customer-payment-request-whatsapp').addEventListener('click', () => {
+  const customer = customers.find((item) => item.id === selectedCustomerId);
+  if (!customer) return;
+  if (workspaceLoadError) { toast('Load the complete khata history before requesting payment.'); return; }
+  const due = balanceOf(customer.id);
+  if (due <= 0) { toast('This customer has no outstanding balance.'); return; }
+  if (!profile.upiId) {
+    toast('Add your shop UPI ID in Profile before requesting payment.');
+    openProfilePopup(true);
+    requestAnimationFrame(() => $('#popup-shop-upi-id').focus());
+    return;
+  }
+  const digits = String(customer.phone || '').replace(/\D/g, '');
+  const phone = digits.length === 10 ? `91${digits}` : digits.length === 12 && digits.startsWith('91') ? digits : '';
+  const customerName = displayCustomerName(customer.name);
+  const shopName = profile.shopName || 'our shop';
+  const amount = money(due);
+  const message = `Hello ${customerName}, your outstanding balance at ${shopName} is ${amount}. You can pay directly to this UPI ID: ${profile.upiId}. Please let me know after payment so I can verify it and update your khata.\n\nनमस्ते ${customerName} जी, ${shopName} के खाते में आपके ${amount} बाकी हैं। कृपया इस UPI ID पर भुगतान करें: ${profile.upiId}। भुगतान करने के बाद मुझे बता दें, ताकि मैं पुष्टि करके आपका खाता अपडेट कर सकूँ।`;
+  const target = phone ? `https://wa.me/${phone}?text=${encodeURIComponent(message)}` : `https://wa.me/?text=${encodeURIComponent(message)}`;
+  window.open(target, '_blank', 'noopener,noreferrer');
+  toast('Payment request opened in WhatsApp. Verify the payment yourself before recording it.');
+});
 $('#customer-history-rows').addEventListener('click', (event) => {
   if (event.target.closest('[data-retry-customer-history]')) loadCustomerLedger(selectedCustomerId);
 });
@@ -715,6 +1104,10 @@ function openCustomer() {
 let openEntryAfterCustomer = false;
 let manualEntryAfterCustomer = null;
 function openEntry(selectedCustomerId = '', draft = null) {
+  if (workspaceLoadError) {
+    toast('Load your complete khata history before recording a new entry.');
+    return;
+  }
   if (!customers.length) {
     openEntryAfterCustomer = true;
     manualEntryAfterCustomer = draft;
@@ -744,12 +1137,105 @@ function populateCustomerSelect(selectedId = '') {
   const options = ordered.map((customer) => {
     const duplicate = nameCounts.get(customerNameMatchKey(customer.name)) > 1;
     const identity = duplicate ? (customer.phone ? ` · ${customer.phone}` : ` · account ${customer.id.slice(-4)}`) : '';
-    return `<option value="${esc(customer.id)}">${esc(customer.name)}${identity} · balance ${money(balanceOf(customer.id))}</option>`;
+    return `<option value="${esc(customer.id)}">${esc(displayCustomerName(customer.name))}${identity} · balance ${money(balanceOf(customer.id))}</option>`;
   }).join('');
   select.innerHTML = `<option value="" disabled>Choose a customer</option>${options}`;
   select.value = selectedId || (ordered.length === 1 ? ordered[0].id : '');
 }
-$('#shop-profile').addEventListener('click', () => $('#profile-dialog').showModal());
+function setProfilePopupEditing(editing) {
+  ['#popup-shop-name', '#popup-owner-name', '#popup-shop-location', '#popup-shop-upi-id'].forEach((selector) => { $(selector).disabled = !editing; });
+  $('#profile-edit').hidden = editing;
+  $('#profile-cancel').hidden = !editing;
+  $('#profile-save').hidden = !editing;
+  $('#profile-delete').hidden = editing;
+  $('#profile-dialog-title').textContent = editing ? 'Edit profile' : 'Profile details';
+}
+function openProfilePopup(editing = false) {
+  $('#popup-shop-name').value = profile.shopName || '';
+  $('#popup-owner-name').value = profile.ownerName || '';
+  $('#popup-shop-location').value = profile.location || '';
+  $('#popup-shop-upi-id').value = profile.upiId || '';
+  $('#popup-account-email').textContent = merchant?.email || 'No email saved';
+  $('#popup-account-phone').textContent = merchant?.phone || 'No phone saved';
+  setProfilePopupEditing(editing);
+  $('#profile-dialog').showModal();
+  if (editing) requestAnimationFrame(() => $('#popup-shop-name').focus());
+}
+$('#profile-link').addEventListener('click', () => openProfilePopup());
+$$('.profile-nav-link').forEach((button) => button.addEventListener('click', () => openProfilePopup()));
+$('#shop-profile').addEventListener('click', () => openProfilePopup());
+$('#profile-edit').addEventListener('click', () => {
+  setProfilePopupEditing(true);
+  requestAnimationFrame(() => $('#popup-shop-name').focus());
+});
+$('#profile-cancel').addEventListener('click', () => {
+  setProfilePopupEditing(false);
+  $('#popup-shop-name').value = profile.shopName || '';
+  $('#popup-owner-name').value = profile.ownerName || '';
+  $('#popup-shop-location').value = profile.location || '';
+  $('#popup-shop-upi-id').value = profile.upiId || '';
+});
+$('#profile-popup-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const saveButton = $('#profile-save');
+  saveButton.disabled = true;
+  try {
+    merchant = await api('/api/v1/auth/me', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        name: $('#popup-shop-name').value.trim(),
+        owner_name: $('#popup-owner-name').value.trim() || null,
+        location: $('#popup-shop-location').value.trim() || null,
+        upi_id: $('#popup-shop-upi-id').value.trim() || null,
+      }),
+    });
+    profile = { shopName: merchant.name, ownerName: merchant.owner_name || '', location: merchant.location || '', upiId: merchant.upi_id || '' };
+    renderAll();
+    setProfilePopupEditing(false);
+    $('#profile-dialog').close();
+    toast('Profile saved');
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    saveButton.disabled = false;
+  }
+});
+$('#profile-delete').addEventListener('click', () => {
+  $('#delete-shop-name-confirm').textContent = profile.shopName;
+  $('#delete-shop-name-input').value = '';
+  $('#confirm-delete-profile').disabled = true;
+  $('#profile-dialog').close();
+  $('#delete-profile-dialog').showModal();
+});
+$('#delete-shop-name-input').addEventListener('input', (event) => {
+  $('#confirm-delete-profile').disabled = event.target.value.trim() !== (profile.shopName || '').trim();
+});
+$('#cancel-delete-profile').addEventListener('click', () => {
+  $('#delete-profile-dialog').close();
+  openProfilePopup();
+});
+$('#confirm-delete-profile').addEventListener('click', async () => {
+  const button = $('#confirm-delete-profile');
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = 'Deleting…';
+  try {
+    await api('/api/v1/auth/me', { method: 'DELETE' });
+    token = '';
+    merchant = null;
+    customers = [];
+    transactions = [];
+    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(PENDING_ENTRY_KEY);
+    pendingLedgerRequest = null;
+    $('#delete-profile-dialog').close();
+    showAuth('Your shop account and its data have been deleted.');
+  } catch (error) {
+    toast(error.message || 'Could not delete this account.');
+  } finally {
+    button.textContent = 'Delete account and data';
+  }
+});
 $('#profile-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {
@@ -759,11 +1245,11 @@ $('#profile-form').addEventListener('submit', async (event) => {
         name: $('#shop-name-input').value.trim(),
         owner_name: $('#owner-name-input').value.trim() || null,
         location: $('#shop-location-input').value.trim() || null,
+        upi_id: $('#shop-upi-id-input').value.trim() || null,
       }),
     });
-    profile = { shopName: merchant.name, ownerName: merchant.owner_name || '', location: merchant.location || '' };
+    profile = { shopName: merchant.name, ownerName: merchant.owner_name || '', location: merchant.location || '', upiId: merchant.upi_id || '' };
     renderAll();
-    $('#profile-dialog').close();
     toast('Shop details saved to your account');
   } catch (error) {
     toast(error.message);
@@ -790,7 +1276,7 @@ $('#customer-form').addEventListener('submit', async (event) => {
     renderAll();
     $('#customer-dialog').close();
     event.target.reset();
-    toast(`${name} added to your khata`);
+    toast(`${displayCustomerName(name)} added to your khata`);
     if (openEntryAfterCustomer) {
       openEntryAfterCustomer = false;
       const correction = manualEntryAfterCustomer;
@@ -811,7 +1297,7 @@ $('#customer-form').addEventListener('submit', async (event) => {
           manualEntryAfterCustomer = null;
           if (matches.length === 1) {
             openEntry(matches[0].id, correction);
-            toast(`${matches[0].name} is already in your khata. Choose udhaar or payment for them; use a distinguishing name for a different person.`);
+            toast(`${displayCustomerName(matches[0].name)} is already in your khata. Choose udhaar or payment for them; use a distinguishing name for a different person.`);
           } else {
             openEntry('', correction);
             toast(`More than one ${name} is in your khata. Choose the correct account by phone or account number.`);
@@ -881,7 +1367,6 @@ async function createLedgerEntry(customerId, amount, type, note = '') {
   pendingLedgerRequest = null;
   sessionStorage.removeItem(PENDING_ENTRY_KEY);
 }
-$('#help-btn').addEventListener('click', () => toast('Your customer and ledger data sync with the VoiceKhata backend.'));
 $('#customer-search').addEventListener('input', renderCustomers);
 $('#balance-filter').addEventListener('change', renderCustomers);
 $('#voice-language').disabled = true;
@@ -889,7 +1374,7 @@ $('#voice-language').textContent = 'HI+EN';
 $('#voice-language').setAttribute('aria-label', 'Hindi and Hinglish voice input');
 $('#voice-language').title = 'Hindi voice input with common English words';
 
-const NUMBER_WORDS = { zero:0, one:1, ek:1, 'एक':1, two:2, do:2, 'दो':2, three:3, teen:3, 'तीन':3, four:4, char:4, chaar:4, 'चार':4, five:5, paanch:5, panch:5, 'पांच':5, 'पाँच':5, six:6, chhe:6, 'छह':6, seven:7, saat:7, 'सात':7, eight:8, aath:8, 'आठ':8, nine:9, nau:9, 'नौ':9, ten:10, das:10, 'दस':10, eleven:11, gyarah:11, 'ग्यारह':11, twelve:12, barah:12, 'बारह':12, thirteen:13, terah:13, 'तेरह':13, fourteen:14, chaudah:14, 'चौदह':14, fifteen:15, pandrah:15, 'पंद्रह':15, sixteen:16, solah:16, 'सोलह':16, seventeen:17, satrah:17, 'सत्रह':17, eighteen:18, atharah:18, 'अठारह':18, nineteen:19, unnis:19, 'उन्नीस':19, twenty:20, bees:20, 'बीस':20, thirty:30, tees:30, 'तीस':30, forty:40, chalis:40, 'चालीस':40, fifty:50, pachaas:50, 'पचास':50, sixty:60, saath:60, 'साठ':60, seventy:70, sattar:70, 'सत्तर':70, eighty:80, assi:80, 'अस्सी':80, ninety:90, nabbe:90, 'नब्बे':90, hundred:100, sau:100, 'सौ':100, thousand:1000, hazaar:1000, 'हजार':1000, lakh:100000, lac:100000 };
+const NUMBER_WORDS = { zero:0, 'शून्य':0, sifar:0, one:1, ek:1, 'एक':1, two:2, do:2, 'दो':2, three:3, teen:3, 'तीन':3, four:4, char:4, chaar:4, 'चार':4, five:5, paanch:5, panch:5, 'पांच':5, 'पाँच':5, six:6, chhe:6, 'छह':6, 'छे':6, seven:7, saat:7, 'सात':7, eight:8, aath:8, 'आठ':8, nine:9, nau:9, 'नौ':9, ten:10, das:10, 'दस':10, eleven:11, gyarah:11, 'ग्यारह':11, twelve:12, barah:12, 'बारह':12, thirteen:13, terah:13, 'तेरह':13, fourteen:14, chaudah:14, 'चौदह':14, fifteen:15, pandrah:15, 'पंद्रह':15, sixteen:16, solah:16, 'सोलह':16, seventeen:17, satrah:17, 'सत्रह':17, eighteen:18, atharah:18, 'अठारह':18, nineteen:19, unnis:19, 'उन्नीस':19, twenty:20, bees:20, 'बीस':20, thirty:30, tees:30, 'तीस':30, forty:40, chalis:40, 'चालीस':40, fifty:50, pachaas:50, 'पचास':50, sixty:60, saath:60, 'साठ':60, seventy:70, sattar:70, 'सत्तर':70, eighty:80, assi:80, 'अस्सी':80, ninety:90, nabbe:90, 'नब्बे':90, hundred:100, sau:100, 'सौ':100, thousand:1000, hazaar:1000, 'हजार':1000, lakh:100000, lac:100000 };
 function normaliseDigits(value) {
   return value.replace(/[०-९]/g, (digit) => String('०१२३४५६७८९'.indexOf(digit)));
 }
@@ -962,38 +1447,6 @@ function parseCommand(raw) {
     raw: raw.trim(),
   };
 }
-function showVoiceConfirmation(entry) {
-  const existing = customers.find((customer) => customer.id === entry.customerId);
-  const ambiguous = entry.ambiguousCustomerIds?.length > 1;
-  const suggestions = !existing && !ambiguous
-    ? customers.filter((customer) => (entry.suggestedCustomerIds || []).includes(customer.id))
-    : [];
-  const needsChoice = ambiguous || suggestions.length > 0;
-  const choiceLabel = $('#voice-customer-choice-wrap');
-  const choice = $('#voice-customer-choice');
-  choiceLabel.hidden = !needsChoice;
-  choice.required = needsChoice;
-  if (ambiguous) {
-    const matches = customers.filter((customer) => entry.ambiguousCustomerIds.includes(customer.id));
-    choice.innerHTML = `<option value="">Choose the right account</option>${matches.map((customer) => `<option value="${esc(customer.id)}">${esc(customer.name)}${customer.phone ? ` · ${esc(customer.phone)}` : ` · account ${esc(customer.id.slice(-4))}`} · balance ${money(balanceOf(customer.id))}</option>`).join('')}`;
-    choice.value = '';
-    $('#confirm-title').textContent = 'Which customer is this?';
-    $('#confirm-copy').textContent = `I found more than one ${entry.customer}. Choose the right account, then confirm ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar' : 'a payment'}.`;
-  } else if (suggestions.length) {
-    choice.innerHTML = `<option value="">Choose the correct name</option><option value="new">New customer: ${esc(entry.customer)}</option>${suggestions.map((customer) => `<option value="${esc(customer.id)}">Existing: ${esc(customer.name)}${customer.phone ? ` · ${esc(customer.phone)}` : ` · account ${esc(customer.id.slice(-4))}`} · balance ${money(balanceOf(customer.id))}</option>`).join('')}`;
-    choice.value = '';
-    $('#confirm-title').textContent = 'Check the customer name';
-    $('#confirm-copy').textContent = `I heard “${entry.customer}”, which is close to an existing name. Choose the right account or select New customer. Then confirm ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar' : 'a payment'}.`;
-  } else {
-    choice.innerHTML = '';
-    choice.required = false;
-    $('#confirm-title').textContent = existing ? 'Add this to the existing khata?' : 'Create a new khata?';
-    $('#confirm-copy').textContent = existing
-      ? `Add ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar for' : 'payment from'} ${existing.name}?`
-      : `I heard “${entry.customer}”. Check the name carefully before saving ${money(entry.amount)} as ${entry.type === 'credit' ? 'udhaar' : 'a payment'}. If it is wrong or an existing customer, choose “Let me fix it”.`;
-  }
-  $('#confirm-dialog').showModal();
-}
 function openManualCorrection(entry) {
   if (!entry.customerId && !entry.ambiguousCustomerIds?.length && entry.type === 'credit') {
     openEntryAfterCustomer = true;
@@ -1020,40 +1473,44 @@ function openManualCorrection(entry) {
 function cancelVoiceSession(sessionId) {
   if (sessionId) api(`/api/v1/voice/sessions/${sessionId}/cancel`, { method: 'POST' }).catch(() => {});
 }
-function prepareVoiceEntry(raw, sessionId = null) {
-  const parsed = parseCommand(raw);
+async function retrySafeVoiceSave(path, options) {
+  try {
+    return await api(path, options);
+  } catch (error) {
+    // A lost response may mean the server committed the entry. Retrying the
+    // same voice-session ID is safe: the backend rejects duplicate commits.
+    if (error.status === 400 || error.status === 401 || error.status === 403 || error.status === 422) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return api(path, options);
+  }
+}
+function prepareVoiceEntry(raw, sessionId = null, parsedEntry = null) {
+  const parsed = parsedEntry ? {
+    customer: parsedEntry.customer_name,
+    customerId: parsedEntry.customer_id || null,
+    ambiguousCustomerIds: [],
+    suggestedCustomerIds: [],
+    amount: Number(parsedEntry.amount),
+    type: parsedEntry.entry_type === 'jama' ? 'payment' : 'credit',
+    typeSpecified: true,
+    raw: raw.trim(),
+  } : parseCommand(raw);
   if (!parsed) { cancelVoiceSession(sessionId); return; }
   if (parsed.error) { cancelVoiceSession(sessionId); toast(parsed.error); speakText(parsed.error); return; }
+  if (parsedEntry?.batchEntries?.length > 1) parsed.batchEntries = parsedEntry.batchEntries;
   parsed.sessionId = sessionId;
   pendingVoiceEntry = parsed;
   beginVoiceConfirmation(parsed);
 }
-function voiceConfirmationPrompt(entry) {
-  const amount = Number(entry.amount).toLocaleString(voiceLanguage === 'hi-IN' ? 'hi-IN' : 'en-IN');
-  const relation = entry.type === 'credit' ? 'उधार' : 'जमा';
-  const englishRelation = entry.type === 'credit' ? 'credit' : 'payment';
-  const existing = customers.find((customer) => customer.id === entry.customerId);
-  const choices = entry.ambiguousCustomerIds?.length
-    ? customers.filter((customer) => entry.ambiguousCustomerIds.includes(customer.id))
-    : (entry.suggestedCustomerIds || []).length
-      ? customers.filter((customer) => entry.suggestedCustomerIds.includes(customer.id))
-      : [];
-  const choiceLabels = choices.map((customer) => customer.phone
-    ? `${customer.name}, phone ending ${customer.phone.replace(/\D/g, '').slice(-4)}`
-    : customer.name);
-  if (voiceLanguage !== 'hi-IN') {
-    if (choices.length) return `I heard ${entry.customer}. Similar accounts: ${choiceLabels.join('; ')}. Say the correct name or phone ending${entry.suggestedCustomerIds?.length ? ', say new for a new customer' : ''}, or say cancel.`;
-    return existing
-      ? `${existing.name}, ${amount} rupees ${englishRelation}. Say yes to save, or no to cancel.`
-      : `I heard ${entry.customer}. Create this customer and record ${amount} rupees as a ${englishRelation}? Say yes to save, or no to cancel.`;
-  }
-  if (choices.length) return `मैंने ${entry.customer} सुना। मिलते-जुलते खाते हैं: ${choiceLabels.join('; ')}। सही ग्राहक का नाम या फोन के आखिरी चार अंक बोलें${entry.suggestedCustomerIds?.length ? ', नया ग्राहक बनाने के लिए नया बोलें' : ''}, या रद्द करने के लिए नहीं बोलें।`;
-  return existing
-    ? `${existing.name}, ${amount} रुपये ${relation}। सही है तो हाँ बोलें। रद्द करने के लिए नहीं बोलें।`
-    : `${entry.customer}, ${amount} रुपये ${relation}। नया खाता बनाकर सेव करने के लिए हाँ बोलें। रद्द करने के लिए नहीं बोलें।`;
-}
 function beginVoiceConfirmation(entry) {
-  voiceConversation = { entry, customerResolved: false, candidates: [], candidateKind: '', newCustomerName: '' };
+  voiceConversation = {
+    entry,
+    customerResolved: false,
+    candidates: [],
+    candidateKind: '',
+    newCustomerName: entry.newCustomerName || '',
+    phoneCollected: Boolean(entry.phoneCollected),
+  };
   pendingVoiceEntry = entry;
   advanceVoiceConversation();
 }
@@ -1062,26 +1519,155 @@ function fallbackConversationToForm(entry, message) {
   cancelVoiceSession(entry.sessionId);
   pendingVoiceEntry = null;
   voiceConversation = null;
-  if (message) toast(`${message} I’m opening the entry form so you can finish safely.`);
-  openManualCorrection(entry);
+  if (isHandsFreeVoiceSession()) {
+    failHandsFreeVoiceSession('माफ़ कीजिए, आवाज़ साफ़ नहीं सुनाई दी। कुछ सेव नहीं हुआ। दोबारा assistant button दबाकर कोशिश करें।');
+    return;
+  }
+  setVoiceReady('Nothing was saved. Start voice entry again when ready.');
+  if (message) toast(`${message} Nothing was saved.`);
 }
-function askConversationQuestion(entry, prompt, onAnswer) {
+async function askConversationQuestion(entry, prompt, onAnswer, options = {}) {
+  await requestVoiceCapabilities();
   pendingVoiceEntry = entry;
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   const canUseGnaniForAnswers = gnaniSttEnabled && window.MediaRecorder && navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext);
-  if ((!canUseGnaniForAnswers && !SpeechRecognition) || (!('speechSynthesis' in window) && !gnaniTtsEnabled)) {
+  if (!canUseGnaniForAnswers || !gnaniTtsEnabled) {
     fallbackConversationToForm(entry, 'Hands-free questions are not available in this browser.');
     return;
   }
   awaitingVoiceReply = true;
+  updateHandsFreeStatus('सवाल सुनिए…');
   $('#voice-title').textContent = 'Please answer by voice';
   $('#voice-subtitle').textContent = 'I will ask one question at a time.';
   $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Speaking a question…</span>';
-  speakText(prompt).then((played) => {
+  let spokenPrompt = prompt;
+  const state = voiceConversation;
+  const candidates = (state?.candidates || []).map((customer) => customer.phone
+    ? `${customer.name} (ending ${customer.phone.replace(/\D/g, '').slice(-4)})`
+    : customer.name).slice(0, 10);
+  if (entry.sessionId && options.generateQuestionWithGemini !== false) {
+    api(`/api/v1/voice/sessions/${entry.sessionId}/question`, {
+      method: 'POST',
+      body: JSON.stringify({
+        draft_question: prompt,
+        current_entry: {
+          customer_name: entry.customer || '',
+          amount: entry.amount == null ? null : String(entry.amount),
+          entry_type: entry.type === 'payment' ? 'jama' : 'udhaar',
+        },
+        candidate_names: candidates,
+        language_code: voiceLanguage,
+      }),
+    }).then((result) => {
+      if (result.parser_notice && !geminiQuestionWarningShown) {
+        geminiQuestionWarningShown = true;
+        toast(result.parser_notice);
+      }
+      spokenPrompt = result.question || prompt;
+    }).catch(() => {
+      if (!geminiQuestionWarningShown) {
+        geminiQuestionWarningShown = true;
+        toast('Gemini question service is unavailable. Using a short built-in question.');
+      }
+    }).finally(() => {
+      if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
+      speakQuestionAndListen();
+    });
+  } else {
+    speakQuestionAndListen();
+  }
+  function speakQuestionAndListen() {
+    const activePrompt = spokenPrompt;
+  const handleAnswer = async (heard) => {
+    if (!entry.sessionId || options.interpretAnswerWithGemini === false) { onAnswer(heard); return; }
+    const awaitingNewCustomerName = voiceConversation?.entry === entry && voiceConversation.awaitingNewCustomerName;
+    let interpretation;
+    try {
+      interpretation = await api(`/api/v1/voice/sessions/${entry.sessionId}/reply`, {
+        method: 'POST',
+        body: JSON.stringify({
+          question: activePrompt,
+          transcript: heard,
+          current_entry: {
+            customer_name: entry.customer || '',
+            customer_id: entry.customerId || null,
+            amount: entry.amount == null ? null : String(entry.amount),
+            entry_type: entry.type === 'payment' ? 'jama' : 'udhaar',
+            relative_date: 'today',
+            note: entry.raw || '',
+          },
+        }),
+      });
+    } catch {
+      // Keep the local conversation usable if Gemini is temporarily unavailable.
+      onAnswer(heard);
+      return;
+    }
+    if (interpretation.parser_notice && !geminiQuestionWarningShown) {
+      geminiQuestionWarningShown = true;
+      toast(interpretation.parser_notice);
+    }
+    const revised = interpretation.updated_entry || {};
+    if (awaitingNewCustomerName) {
+      // This turn is collecting a proposed NEW customer's name. Do not let a
+      // Gemini match to an existing ID turn that answer into account selection.
+      // Keep yes/no answers intact; use Gemini's Latin-script name when the
+      // shopkeeper supplied a name so duplicate checks can ask for a distinction.
+      const intent = voiceIntent(transcriptWords(heard));
+      const answer = intent.yes || intent.no || intent.isNew
+        ? heard
+        : (revised.customer_name || interpretation.normalized_answer || heard);
+      onAnswer(answer);
+      return;
+    }
+    if (revised.customer_name) entry.customer = revised.customer_name;
+    if (revised.customer_id) entry.customerId = revised.customer_id;
+    if (revised.amount != null && Number(revised.amount) > 0) entry.amount = Number(revised.amount);
+    if (revised.entry_type === 'udhaar' || revised.entry_type === 'jama') {
+      entry.type = revised.entry_type === 'jama' ? 'payment' : 'credit';
+      entry.typeSpecified = true;
+    }
+    const heardWords = transcriptWords(heard);
+    if (responseHas(heardWords, new Set(['cancel', 'रद्द', 'stop', 'बंद']))) {
+      cancelVoiceConversation(entry);
+      return;
+    }
+    if (interpretation.action === 'CLARIFY') {
+      askConversationQuestion(entry, interpretation.spoken_response || prompt, onAnswer);
+      return;
+    }
+    if (interpretation.action === 'CORRECT') {
+      const state = voiceConversation?.entry === entry ? voiceConversation : {
+        entry, customerResolved: Boolean(entry.customerId || entry.newCustomerName), candidates: [], candidateKind: '', newCustomerName: entry.newCustomerName || '',
+      };
+      voiceConversation = state;
+      // A recognized name alone must not select an existing account. When the
+      // conversation was still resolving the customer, re-run the explicit
+      // existing-vs-new question even if Gemini matched the spoken name to an
+      // existing customer ID. This prevents credit being silently assigned to
+      // someone with the same name.
+      state.customerResolved = state.customerResolved || Boolean(state.newCustomerName);
+      advanceVoiceConversation();
+      return;
+    }
+    onAnswer(interpretation.normalized_answer || heard);
+  };
+  speakText(activePrompt).then((played) => {
     if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
     if (!played) { fallbackConversationToForm(entry, 'Could not play the voice question.'); return; }
-    listenForVoiceConfirmation(entry, SpeechRecognition, 0, onAnswer, (message) => fallbackConversationToForm(entry, message));
+    updateHandsFreeStatus('जवाब सुन रहा हूँ…');
+    listenForVoiceConfirmation(entry, (answer) => {
+      handsFreeQuestionRetries = 0;
+      handleAnswer(answer);
+    }, (message) => {
+      if (isHandsFreeVoiceSession() && handsFreeQuestionRetries < 2) {
+        handsFreeQuestionRetries += 1;
+        retryHandsFreeQuestion(entry, activePrompt, onAnswer);
+        return;
+      }
+      fallbackConversationToForm(entry, message);
+    });
   });
+  }
 }
 function transcriptWords(value) {
   return [...String(value || '').normalize('NFC').toLocaleLowerCase('en-IN').matchAll(/[\p{L}\p{M}]+/gu)].map((match) => match[0]);
@@ -1096,6 +1682,61 @@ function parseAmountReply(raw) {
   }
   const spoken = spokenAmount(text);
   return spoken?.value > 0 ? spoken.value : null;
+}
+function parseMobileNumberReply(raw) {
+  const text = normaliseDigits(String(raw || '').trim());
+  let digits = (text.match(/\d/g) || []).join('');
+  if (![10, 11, 12].includes(digits.length)) {
+    const ignored = new Set(['mobile', 'phone', 'number', 'mera', 'mere', 'hai', 'ji', 'नंबर', 'मोबाइल', 'फोन', 'मेरा', 'मेरे', 'है', 'जी']);
+    const tokens = transcriptWords(text);
+    const spokenDigits = [];
+    for (const token of tokens) {
+      if (ignored.has(token)) continue;
+      const digit = NUMBER_WORDS[token];
+      if (digit == null || digit < 0 || digit > 9) return null;
+      spokenDigits.push(String(digit));
+    }
+    digits = spokenDigits.join('');
+  }
+  if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+  if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  return /^[6-9]\d{9}$/.test(digits) ? digits : null;
+}
+function customerHasPhone(phone) {
+  return customers.some((customer) => String(customer.phone || '').replace(/\D/g, '') === phone);
+}
+function collectNewCustomerPhone(entry, prompt = 'मोबाइल नंबर बोलें। नहीं देना हो तो “स्किप” कहें।') {
+  askConversationQuestion(entry, prompt, (heard) => {
+    const state = voiceConversation;
+    if (!state) return;
+    const normalizedAnswer = String(heard || '').normalize('NFC').trim().toLocaleLowerCase('en-IN');
+    const words = transcriptWords(normalizedAnswer);
+    const skip = responseHas(words, new Set([
+      'skip', 'स्किप', 'chhodo', 'chhod', 'mat', 'nahi', 'nahin', 'no', 'not', 'dont',
+      'छोड़ें', 'छोड़ें', 'छोड़', 'छोड़ना', 'छोड़िए', 'नहीं', 'नही', 'मत',
+    ])) || /(?:नंबर|फोन|मोबाइल)\s+(?:नहीं|नही|मत|नहीं देना|नहीं बताना)/iu.test(normalizedAnswer)
+      || /\b(?:don't|do not|not)\s+(?:want to\s+)?(?:share|give|provide)\b/iu.test(normalizedAnswer)
+      || /\b(?:don't|do not)\s+want(?: to)?\b/iu.test(normalizedAnswer)
+      || /\b(?:no|not)\s+(?:phone|mobile|number)\b/iu.test(normalizedAnswer);
+    const phone = parseMobileNumberReply(heard);
+    if (!phone && skip) {
+      state.newCustomerPhone = null;
+      state.phoneCollected = true;
+      advanceVoiceConversation();
+      return;
+    }
+    if (!phone) {
+      collectNewCustomerPhone(entry, '10 अंकों का नंबर बोलें, या “स्किप” कहें।');
+      return;
+    }
+    if (customerHasPhone(phone)) {
+      collectNewCustomerPhone(entry, 'यह नंबर पहले से है। दूसरा नंबर बोलें या “स्किप” कहें।');
+      return;
+    }
+    state.newCustomerPhone = phone;
+    state.phoneCollected = true;
+    advanceVoiceConversation();
+  }, { interpretAnswerWithGemini: false, generateQuestionWithGemini: false });
 }
 function cleanCustomerNameReply(raw) {
   const withoutPolitePhrase = normaliseDigits(String(raw || ''))
@@ -1133,11 +1774,13 @@ function setVoiceCustomerCandidates(candidates, kind) {
 function beginNewVoiceCustomerName(requireDistinct) {
   const state = voiceConversation;
   if (!state) return;
+  state.awaitingNewCustomerName = true;
   const name = state.entry.customer;
   const prompt = requireDistinct
-    ? `${name} नाम का customer पहले से है। New customer को किस अलग नाम से save करूँ? Example: ${name} - दूध वाले।`
-    : `क्या new customer को ${name} नाम से save करूँ? हाँ बोलें, या कोई अलग पहचान वाला नाम बताएँ।`;
+    ? `${name} पहले से है। नए ग्राहक का अलग नाम?`
+    : `नया ${name}, इसी नाम से सेव करूँ या अलग नाम?`;
   askConversationQuestion(state.entry, prompt, (heard) => {
+    state.awaitingNewCustomerName = false;
     const words = transcriptWords(heard);
     const intent = voiceIntent(words);
     if (!requireDistinct && intent.yes) {
@@ -1152,7 +1795,9 @@ function beginNewVoiceCustomerName(requireDistinct) {
     }
     const candidateName = cleanCustomerNameReply(heard);
     if (!requireDistinct && intent.no) {
-      askConversationQuestion(state.entry, `ठीक है। Customer का अलग नाम बताएँ, जैसे ${name} - दूध वाले।`, (differentName) => {
+      state.awaitingNewCustomerName = true;
+      askConversationQuestion(state.entry, `ठीक। नए ग्राहक का अलग नाम?`, (differentName) => {
+        state.awaitingNewCustomerName = false;
         const resolvedName = cleanCustomerNameReply(differentName);
         if (!resolvedName || customers.some((customer) => sameCustomerName(customer.name, resolvedName))) {
           beginNewVoiceCustomerName(true);
@@ -1205,8 +1850,8 @@ function startVoiceCustomerResolution() {
       ? `${customer.name}, फोन के आखिरी चार अंक ${customer.phone.replace(/\D/g, '').slice(-4)}`
       : customer.name).join(' या ');
     const prompt = exact.length
-      ? `${entry.customer} नाम का customer पहले से है। क्या यह existing customer है या new customer? पुराना या नया बोलें।`
-      : `मैंने ${entry.customer} सुना। Existing customer ${details} मिलता-जुलता है। क्या वही customer है या new customer? पुराना या नया बोलें।`;
+      ? `${entry.customer} पहले से है। पुराना ग्राहक या नया ग्राहक?`
+      : `कौन सा ${details}? पुराना ग्राहक या नया ग्राहक?`;
     askConversationQuestion(entry, prompt, (heard) => {
       const words = transcriptWords(heard);
       const intent = voiceIntent(words);
@@ -1214,7 +1859,7 @@ function startVoiceCustomerResolution() {
         if (candidates.length === 1) { resolveVoiceCustomer(candidates[0]); return; }
         const selected = voiceReplyChoice(entry, heard);
         if (selected) { resolveVoiceCustomer(selected); return; }
-        askConversationQuestion(entry, `कई पुराने खाते मिले। सही खाते का फोन नंबर, आखिरी चार अंक बोलें।`, (accountReply) => {
+        askConversationQuestion(entry, `कौन सा खाता? फोन के आखिरी चार अंक?`, (accountReply) => {
           const choice = voiceReplyChoice(entry, accountReply);
           if (choice) resolveVoiceCustomer(choice);
           else fallbackConversationToForm(entry, 'I could not identify the old account.');
@@ -1222,7 +1867,7 @@ function startVoiceCustomerResolution() {
         return;
       }
       if (intent.isNew) { beginNewVoiceCustomerName(true); return; }
-      askConversationQuestion(entry, `पुराना ${entry.customer} या नया ग्राहक बोलें।`, arguments_ => {
+      askConversationQuestion(entry, `पुराना ग्राहक या नया ग्राहक?`, arguments_ => {
         const next = voiceIntent(transcriptWords(arguments_));
         if (next.old && candidates.length === 1) resolveVoiceCustomer(candidates[0]);
         else if (next.isNew) beginNewVoiceCustomerName(true);
@@ -1232,11 +1877,11 @@ function startVoiceCustomerResolution() {
     return;
   }
   setVoiceCustomerCandidates([], 'new');
-  askConversationQuestion(entry, `${entry.customer} नाम का existing customer नहीं मिला। क्या यह new customer है? हाँ या नहीं बोलें।`, (heard) => {
+  askConversationQuestion(entry, `${entry.customer} नहीं मिला। नया ग्राहक है?`, (heard) => {
     const intent = voiceIntent(transcriptWords(heard));
     if (intent.yes || intent.isNew) { beginNewVoiceCustomerName(false); return; }
     if (intent.no) {
-      askConversationQuestion(entry, `पुराने ग्राहक का पूरा नाम बोलें।`, (nameReply) => {
+      askConversationQuestion(entry, `पुराने ग्राहक का पूरा नाम?`, (nameReply) => {
         const oldName = cleanCustomerNameReply(nameReply);
         if (!oldName) { fallbackConversationToForm(entry, 'I could not hear the customer name.'); return; }
         entry.customer = oldName;
@@ -1253,10 +1898,10 @@ function advanceVoiceConversation() {
   if (!state) return;
   const entry = state.entry;
   if (entry.amount == null) {
-    askConversationQuestion(entry, `कितने रुपये की एंट्री करनी है?`, (heard) => {
+    askConversationQuestion(entry, `कितने रुपये?`, (heard) => {
       const amount = parseAmountReply(heard);
       if (!amount) {
-        askConversationQuestion(entry, `रुपयों की संख्या साफ बोलें, जैसे पाँच सौ।`, (retry) => {
+        askConversationQuestion(entry, `रकम साफ़ बोलें, जैसे पाँच सौ।`, (retry) => {
           const retryAmount = parseAmountReply(retry);
           if (!retryAmount) fallbackConversationToForm(entry, 'I could not understand the amount.');
           else { entry.amount = retryAmount; advanceVoiceConversation(); }
@@ -1266,7 +1911,7 @@ function advanceVoiceConversation() {
     return;
   }
   if (!entry.typeSpecified) {
-    askConversationQuestion(entry, `यह उधार है या जमा पेमेंट?`, (heard) => {
+    askConversationQuestion(entry, `उधार या जमा?`, (heard) => {
       const words = transcriptWords(heard);
       if (responseHas(words, new Set(['उधार', 'उधर', 'उधारी', 'udhaar', 'udhar', 'credit']))) {
         entry.type = 'credit'; entry.typeSpecified = true; advanceVoiceConversation(); return;
@@ -1274,7 +1919,7 @@ function advanceVoiceConversation() {
       if (responseHas(words, new Set(['जमा', 'jama', 'payment', 'paid', 'मिले', 'मिला', 'received']))) {
         entry.type = 'payment'; entry.typeSpecified = true; advanceVoiceConversation(); return;
       }
-      askConversationQuestion(entry, `कृपया साफ बोलें: उधार या जमा?`, (retry) => {
+      askConversationQuestion(entry, `उधार या जमा, कौन सा?`, (retry) => {
         const next = transcriptWords(retry);
         if (responseHas(next, new Set(['उधार', 'उधर', 'उधारी', 'udhaar', 'udhar', 'credit']))) { entry.type = 'credit'; entry.typeSpecified = true; advanceVoiceConversation(); }
         else if (responseHas(next, new Set(['जमा', 'jama', 'payment', 'paid', 'मिले', 'मिला', 'received']))) { entry.type = 'payment'; entry.typeSpecified = true; advanceVoiceConversation(); }
@@ -1284,12 +1929,23 @@ function advanceVoiceConversation() {
     return;
   }
   if (!state.customerResolved) { startVoiceCustomerResolution(); return; }
+  if (state.newCustomerName && !state.phoneCollected) {
+    collectNewCustomerPhone(entry);
+    return;
+  }
   entry.customer = state.newCustomerName || entry.customer;
+  entry.newCustomerPhone = state.newCustomerPhone || null;
+  entry.newCustomerName = state.newCustomerName || '';
+  entry.phoneCollected = state.phoneCollected;
   pendingVoiceEntry = entry;
   voiceConversation = null;
-  askConversationQuestion(entry, voiceConfirmationPrompt(entry), (heard) => handleVoiceConfirmationReply(entry, heard, window.SpeechRecognition || window.webkitSpeechRecognition, 0));
+  $('#voice-title').textContent = 'Saving your entry';
+  $('#voice-subtitle').textContent = 'Adding it to your khata now.';
+  $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(displayCustomerName(entry.customer))} · ${money(entry.amount)} · ${entry.type === 'credit' ? 'Udhaar' : 'Payment'}</span>`;
+  $('#confirm-transaction').click();
 }
 function releaseVoiceReplyAudio() {
+  if (voiceReplyProcessedStream) { voiceReplyProcessedStream.getTracks().forEach((track) => track.stop()); voiceReplyProcessedStream = null; }
   if (voiceReplyStream) { voiceReplyStream.getTracks().forEach((track) => track.stop()); voiceReplyStream = null; }
   if (voiceReplyContext) { voiceReplyContext.close().catch(() => {}); voiceReplyContext = null; }
   if (voiceReplyFrame) cancelAnimationFrame(voiceReplyFrame);
@@ -1315,20 +1971,20 @@ function listenForGnaniReply(entry, onReply, onFallback) {
   };
   (async () => {
     try {
-      voiceReplyStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      voiceReplyStream = await navigator.mediaDevices.getUserMedia(voiceMicrophoneConstraints());
       if (!awaitingVoiceReply || pendingVoiceEntry !== entry) { releaseVoiceReplyAudio(); return; }
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       if (!AudioContext || !window.MediaRecorder) throw new Error('This browser cannot record voice answers.');
       voiceReplyContext = new AudioContext();
       if (voiceReplyContext.state === 'suspended') await voiceReplyContext.resume();
-      const analyserNode = voiceReplyContext.createAnalyser();
-      analyserNode.fftSize = 256;
-      voiceReplyContext.createMediaStreamSource(voiceReplyStream).connect(analyserNode);
+      const enhanced = createEnhancedAudioPath(voiceReplyStream, voiceReplyContext);
+      voiceReplyProcessedStream = enhanced.stream;
+      const analyserNode = enhanced.analyser;
       const samples = new Uint8Array(analyserNode.fftSize);
       const mimeType = typeof MediaRecorder.isTypeSupported === 'function'
         ? ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find((type) => MediaRecorder.isTypeSupported(type))
         : '';
-      voiceReplyRecorder = mimeType ? new MediaRecorder(voiceReplyStream, { mimeType }) : new MediaRecorder(voiceReplyStream);
+      voiceReplyRecorder = mimeType ? new MediaRecorder(voiceReplyProcessedStream, { mimeType }) : new MediaRecorder(voiceReplyProcessedStream);
       voiceReplyRecorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
       voiceReplyRecorder.onerror = () => finishFallback('Could not record your answer. Please try again.');
       voiceReplyRecorder.onstop = async () => {
@@ -1342,6 +1998,7 @@ function listenForGnaniReply(entry, onReply, onFallback) {
         if (!audio.size || audio.size < 2048) { finishFallback('I did not hear your answer. Please try again.'); return; }
         try {
           $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Checking your answer…</span>';
+          updateHandsFreeStatus('आपका जवाब समझ रहा हूँ…');
           const wav = await encodeWav16k(audio);
           const form = new FormData();
           form.append('audio', wav, 'voice-answer.wav');
@@ -1351,13 +2008,15 @@ function listenForGnaniReply(entry, onReply, onFallback) {
           handled = true;
           stopVoiceReply();
           if (onReply) onReply(result.transcript);
-          else handleVoiceConfirmationReply(entry, result.transcript, window.SpeechRecognition || window.webkitSpeechRecognition, 0);
+          else if (onFallback) onFallback('I could not process that voice reply.');
+          else fallbackConversationToForm(entry, 'I could not process that voice reply.');
         } catch (error) {
           finishFallback(error.message || 'Could not understand your answer. Please try again.');
         }
       };
       voiceReplyRecorder.start(200);
       $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Listening… speak your answer</span>';
+      updateHandsFreeStatus('जवाब सुन रहा हूँ…');
       const monitor = () => {
         if (!awaitingVoiceReply || pendingVoiceEntry !== entry || handled || !voiceReplyRecorder || voiceReplyRecorder.state !== 'recording') return;
         analyserNode.getByteTimeDomainData(samples);
@@ -1397,50 +2056,25 @@ function stopVoiceReply() {
 }
 function showVoiceReplyFallback(entry, message) {
   if (!awaitingVoiceReply) return;
+  if (isHandsFreeVoiceSession()) {
+    failHandsFreeVoiceSession('माफ़ कीजिए, आपका जवाब सुनाई नहीं दिया। कुछ सेव नहीं हुआ। दोबारा assistant button दबाकर कोशिश करें।');
+    return;
+  }
   stopVoiceReply();
-  showVoiceConfirmation(entry);
-  if (message) toast(`${message} Use the confirmation controls on screen.`);
+  pendingVoiceEntry = null;
+  voiceConversation = null;
+  cancelVoiceSession(entry.sessionId);
+  setVoiceReady('Nothing was saved. Start voice entry again when ready.');
+  if (message) toast(`${message} Nothing was saved. Please start voice entry again.`);
 }
-function listenForVoiceConfirmation(entry, SpeechRecognition, attempt, onReply = null, onFallback = null) {
+function listenForVoiceConfirmation(entry, onReply = null, onFallback = null) {
   if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
   if (gnaniSttEnabled && window.MediaRecorder && navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext)) {
     listenForGnaniReply(entry, onReply, onFallback);
     return;
   }
-  let reply;
-  try {
-    reply = new SpeechRecognition();
-    reply.lang = voiceLanguage;
-    reply.interimResults = false;
-    reply.continuous = false;
-    voiceReplyRecognition = reply;
-    $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Listening for your answer…</span>';
-    reply.onresult = (event) => {
-      const heard = Array.from(event.results).map((result) => result[0].transcript).join(' ').trim();
-      stopVoiceReply();
-      if (onReply) onReply(heard);
-      else handleVoiceConfirmationReply(entry, heard, SpeechRecognition, attempt);
-    };
-    reply.onerror = (event) => {
-      if (awaitingVoiceReply) {
-        if (onFallback) { stopVoiceReply(); onFallback(event.error === 'not-allowed' ? 'Allow microphone access to confirm by voice.' : 'I could not hear your answer.'); }
-        else showVoiceReplyFallback(entry, event.error === 'not-allowed' ? 'Allow microphone access to confirm by voice.' : 'I could not hear your answer.');
-      }
-    };
-    reply.onend = () => {
-      if (awaitingVoiceReply) {
-        if (onFallback) { stopVoiceReply(); onFallback('I did not hear an answer.'); }
-        else showVoiceReplyFallback(entry, 'I did not hear an answer.');
-      }
-    };
-    voiceReplyTimer = setTimeout(() => {
-      if (onFallback) { stopVoiceReply(); onFallback('I did not hear an answer.'); }
-      else showVoiceReplyFallback(entry, 'I did not hear an answer.');
-    }, 10000);
-    reply.start();
-  } catch {
-    showVoiceReplyFallback(entry, 'Voice confirmation could not start.');
-  }
+  if (onFallback) onFallback('Gnani speech recognition is not available.');
+  else showVoiceReplyFallback(entry, 'Gnani speech recognition is not available.');
 }
 function voiceReplyChoice(entry, heard) {
   const text = customerNameMatchKey(heard);
@@ -1456,79 +2090,16 @@ function voiceReplyChoice(entry, heard) {
   }
   return null;
 }
-function handleVoiceConfirmationReply(entry, heard, SpeechRecognition, attempt) {
-  if (pendingVoiceEntry !== entry) return;
-  const words = [...heard.normalize('NFC').toLocaleLowerCase('en-IN').matchAll(/[\p{L}\p{M}]+/gu)].map((match) => match[0]);
-  const noWords = new Set(['no', 'nahi', 'nahin', 'नहीं', 'नही', 'रद्द', 'cancel', 'stop']);
-  const yesWords = new Set(['yes', 'yeah', 'haan', 'han', 'हाँ', 'हां', 'हा', 'जी', 'सही', 'ठीक', 'save', 'confirm']);
-  if (words.some((word) => noWords.has(word))) {
-    pendingVoiceEntry = null;
-    voiceConversation = null;
-    cancelVoiceSession(entry.sessionId);
-    setVoiceReady('Entry cancelled. Nothing was saved.');
-    speakText(voiceLanguage === 'hi-IN' ? 'ठीक है, एंट्री रद्द कर दी। कुछ सेव नहीं हुआ।' : 'Okay, the entry is cancelled. Nothing was saved.');
-    return;
-  }
-  const hasChoices = entry.ambiguousCustomerIds?.length || entry.suggestedCustomerIds?.length;
-  if (hasChoices) {
-    const customer = voiceReplyChoice(entry, heard);
-    if (customer) {
-      entry.customerId = customer.id;
-      entry.customer = customer.name;
-      entry.ambiguousCustomerIds = [];
-      entry.suggestedCustomerIds = [];
-      pendingVoiceEntry = entry;
-      $('#voice-customer-choice').value = customer.id;
-      $('#confirm-transaction').click();
-      return;
-    }
-    if (words.some((word) => ['new', 'naya', 'नया', 'नयी', 'नए'].includes(word)) && entry.suggestedCustomerIds?.length) {
-      entry.ambiguousCustomerIds = [];
-      entry.suggestedCustomerIds = [];
-      pendingVoiceEntry = entry;
-      $('#confirm-transaction').click();
-      return;
-    }
-  } else if (words.some((word) => yesWords.has(word))) {
-    $('#confirm-transaction').click();
-    return;
-  }
-  if (attempt < 1) {
-    const retryPrompt = hasChoices
-      ? `${voiceLanguage === 'hi-IN' ? 'माफ कीजिए, समझ नहीं आया। ' : 'Sorry, I did not understand. '}${voiceConfirmationPrompt(entry)}`
-      : (voiceLanguage === 'hi-IN' ? 'माफ कीजिए, समझ नहीं आया। सेव करने के लिए हाँ, रद्द करने के लिए नहीं बोलें।' : 'Sorry, I did not understand. Say yes to save or no to cancel.');
-    speakText(retryPrompt).then((played) => {
-      if (played && pendingVoiceEntry === entry) listenForVoiceConfirmation(entry, SpeechRecognition, attempt + 1);
-      else if (pendingVoiceEntry === entry) showVoiceReplyFallback(entry, 'I could not understand your answer.');
-    });
-    return;
-  }
-  pendingVoiceEntry = entry;
-  showVoiceConfirmation(entry);
-  toast('I could not understand the voice reply. Please confirm on screen.');
-}
-function dismissVoiceConfirmation() {
-  const sessionId = pendingVoiceEntry?.sessionId;
+function cancelVoiceConversation(entry) {
   stopVoiceReply();
-  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   pendingVoiceEntry = null;
   voiceConversation = null;
-  cancelVoiceSession(sessionId);
-  setVoiceReady();
+  cancelVoiceSession(entry.sessionId);
+  setVoiceReady('Entry cancelled. Nothing was saved.');
+  const reply = 'ठीक, एंट्री रद्द। कुछ सेव नहीं हुआ।';
+  if (isHandsFreeVoiceSession()) finishHandsFreeAfterSpeech(reply);
+  else speakText(reply);
 }
-$('#cancel-transaction').addEventListener('click', () => {
-  const entry = pendingVoiceEntry;
-  dismissVoiceConfirmation();
-  if ($('#confirm-dialog').open) $('#confirm-dialog').close();
-  if (entry) openManualCorrection(entry);
-});
-$('#confirm-dialog .dialog-close').addEventListener('click', dismissVoiceConfirmation);
-$('#confirm-dialog').addEventListener('cancel', dismissVoiceConfirmation);
-$('#confirm-dialog').addEventListener('close', () => {
-  // The title-bar close button submits its method="dialog" form without firing
-  // the cancel event. Still cancel a server-side voice session when dismissed.
-  if (pendingVoiceEntry) dismissVoiceConfirmation();
-});
 let confirmingVoiceEntry = false;
 $('#confirm-transaction').addEventListener('click', async () => {
   if (!pendingVoiceEntry || confirmingVoiceEntry) return;
@@ -1538,29 +2109,34 @@ $('#confirm-transaction').addEventListener('click', async () => {
   const entry = pendingVoiceEntry;
   pendingVoiceEntry = null;
   voiceConversation = null;
-  if ($('#confirm-dialog').open) $('#confirm-dialog').close();
   try {
+    if (entry.batchEntries?.length > 1) {
+      if (entry.batchEntries.some((item) => !item.customer_id)) {
+        cancelVoiceSession(entry.sessionId);
+        setVoiceReady('Nothing was saved. Please record one customer at a time.');
+        toast('One or more customer names need clarification. Please record one customer at a time.');
+        if (isHandsFreeVoiceSession()) finishHandsFreeAfterSpeech('ग्राहक का नाम साफ़ नहीं है। सुरक्षा के लिए कुछ सेव नहीं हुआ। एक बार में एक ग्राहक की एंट्री बोलें।');
+        else speakText('ग्राहक का नाम साफ़ नहीं है। सुरक्षा के लिए कुछ सेव नहीं हुआ। एक बार में एक ग्राहक की एंट्री बोलें।');
+        return;
+      }
+      await retrySafeVoiceSave(`/api/v1/voice/sessions/${entry.sessionId}/confirm-all`, { method: 'POST' });
+      await loadWorkspace();
+      renderAll();
+      setVoiceReady(`${entry.batchEntries.length} entries saved. Your khata is up to date.`);
+      toast(`${entry.batchEntries.length} entries saved to your khata`);
+      const savedMessage = `${entry.batchEntries.length} एंट्री खाते में दर्ज हुईं।`;
+      if (isHandsFreeVoiceSession()) finishHandsFreeAfterSpeech(savedMessage);
+      else speakText(savedMessage);
+      return;
+    }
     let customerId = entry.customerId;
-    if (entry.ambiguousCustomerIds?.length > 1) {
-      customerId = $('#voice-customer-choice').value;
-      if (!customerId) {
-        toast('Choose which customer should get this entry.');
-        pendingVoiceEntry = entry;
-        showVoiceConfirmation(entry);
-        return;
-      }
-    } else if (entry.suggestedCustomerIds?.length) {
-      const selected = $('#voice-customer-choice').value;
-      if (!selected) {
-        toast('Choose the correct existing name, or select New customer.');
-        pendingVoiceEntry = entry;
-        showVoiceConfirmation(entry);
-        return;
-      }
-      customerId = selected === 'new' ? null : selected;
+    if (entry.ambiguousCustomerIds?.length || entry.suggestedCustomerIds?.length) {
+      pendingVoiceEntry = entry;
+      beginVoiceConfirmation(entry);
+      return;
     }
     if (!customerId) {
-      const created = await api('/api/v1/customers', { method: 'POST', body: JSON.stringify({ name: entry.customer, phone: null }) });
+      const created = await api('/api/v1/customers', { method: 'POST', body: JSON.stringify({ name: entry.customer, phone: entry.newCustomerPhone || null }) });
       customerId = created.id;
     }
     const payload = {
@@ -1570,7 +2146,7 @@ $('#confirm-transaction').addEventListener('click', async () => {
       note: entry.raw || null,
     };
     if (entry.sessionId) {
-      await api(`/api/v1/voice/sessions/${entry.sessionId}/confirm`, { method: 'POST', body: JSON.stringify(payload) });
+      await retrySafeVoiceSave(`/api/v1/voice/sessions/${entry.sessionId}/confirm`, { method: 'POST', body: JSON.stringify(payload) });
       await loadWorkspace();
       renderAll();
     } else {
@@ -1579,14 +2155,16 @@ $('#confirm-transaction').addEventListener('click', async () => {
     setVoiceReady('Entry saved. Your khata is up to date.');
     toast('Confirmed entry saved to your khata');
     const savedCustomerName = customerName(customerId);
-    const savedType = entry.type === 'credit' ? 'उधार की एंट्री' : 'जमा की एंट्री';
-    speakText(`${savedCustomerName}, ${Number(entry.amount).toLocaleString('hi-IN')} रुपये की ${savedType} सेव हो गई।`);
+    const savedMessage = `${savedCustomerName} के ${Number(entry.amount).toLocaleString('hi-IN')} रुपये ${entry.type === 'credit' ? 'उधार' : 'जमा'} दर्ज हुए।`;
+    if (isHandsFreeVoiceSession()) finishHandsFreeAfterSpeech(savedMessage);
+    else speakText(savedMessage);
   } catch (error) {
     if (entry.sessionId && error.status === 409) {
       try {
         await loadWorkspace();
         renderAll();
         toast('This voice entry was already handled. Your ledger has been refreshed.');
+        if (isHandsFreeVoiceSession()) finishHandsFreeAfterSpeech('यह voice entry पहले ही दर्ज हो चुकी है। आपका खाता अपडेट कर दिया है।');
         return;
       } catch {}
     }
@@ -1599,27 +2177,34 @@ $('#confirm-transaction').addEventListener('click', async () => {
           pendingVoiceEntry = matches.length === 1
             ? { ...entry, customer: matches[0].name, customerId: matches[0].id, ambiguousCustomerIds: [], suggestedCustomerIds: [] }
             : { ...entry, customer: matches[0].name, customerId: null, ambiguousCustomerIds: matches.map((customer) => customer.id), suggestedCustomerIds: [] };
-          showVoiceConfirmation(pendingVoiceEntry);
+          beginVoiceConfirmation(pendingVoiceEntry);
           toast(matches.length === 1
-            ? `${matches[0].name} already exists. Confirm again to add this entry to that account.`
-            : `More than one ${matches[0].name} exists. Choose the correct account, then confirm.`);
+            ? `${matches[0].name} already exists. I’ll ask which account you mean.`
+            : `More than one ${matches[0].name} exists. I’ll ask which account you mean.`);
           return;
         }
       } catch (refreshError) {
         toast(`Customer already exists, but the list could not refresh: ${refreshError.message}`);
+        if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession('ग्राहक की जानकारी जाँच नहीं हो पाई। कुछ सेव नहीं हुआ। नेटवर्क ठीक होने पर फिर कोशिश करें।');
         return;
       }
     }
     if (entry.sessionId && !pendingVoiceEntry) {
-      // Keep the explicit confirmation available after a transient failure.
-      // The backend binds a voice session to at most one ledger entry, so a
-      // retry cannot create a second entry if the first response was lost.
-      pendingVoiceEntry = entry;
-      showVoiceConfirmation(entry);
-      toast('Could not confirm the save. Check your connection, then try again.');
+      // Do not leave a failed voice save in a confirmation dialog. The voice
+      // session can only create one ledger entry, so an ambiguous result must
+      // be checked against the refreshed ledger before another attempt.
+      voiceConversation = null;
+      if (isHandsFreeVoiceSession()) {
+        failHandsFreeVoiceSession('एंट्री सेव होने की पुष्टि नहीं मिल पाई। दोबारा बोलने से पहले खाता जाँचें।');
+        return;
+      }
+      setVoiceReady('Entry was not saved. Start voice entry again after checking your connection.');
+      toast('Could not save the entry. Nothing was saved; check your connection and try again.');
+      speakText('एंट्री सेव नहीं हुई। कृपया इंटरनेट जाँचकर दोबारा बोलें।');
       return;
     }
     toast(error.message);
+    if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession('एंट्री सेव नहीं हो पाई। कुछ सेव नहीं हुआ। नेटवर्क जाँचकर फिर कोशिश करें।');
   } finally {
     confirmingVoiceEntry = false;
     confirmButton.disabled = false;
@@ -1692,7 +2277,6 @@ function stopListening() {
   $('#voice-button').classList.remove('listening', 'processing');
   $('#voice-button').disabled = false;
   $('#voice-button').setAttribute('aria-label', 'Start listening');
-  if (recognition) { try { recognition.stop(); } catch {} recognition = null; }
   if (recordingTimer) { clearTimeout(recordingTimer); recordingTimer = null; }
   if (mediaRecorder?.state === 'recording') {
     processRecordingOnStop = false;
@@ -1711,63 +2295,72 @@ function setVoiceReady(caption = 'Tap the waveform to speak') {
   $('#voice-subtitle').textContent = 'Say the customer, amount, and whether it is udhaar or a payment.';
   $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(caption)}</span>`;
 }
-async function startBrowserRecognition() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) { toast('Voice input is unavailable in this browser. Use New entry to record this transaction.'); return; }
+function voiceMicrophoneConstraints() {
+  const audio = {
+    channelCount: { ideal: 1 },
+    echoCancellation: { ideal: true },
+    noiseSuppression: { ideal: true },
+    autoGainControl: { ideal: true },
+  };
+  const supported = navigator.mediaDevices?.getSupportedConstraints?.() || {};
+  if (supported.voiceIsolation) audio.voiceIsolation = { ideal: true };
+  return { audio };
+}
+function createEnhancedAudioPath(stream, context) {
+  const source = context.createMediaStreamSource(stream);
+  const highPass = context.createBiquadFilter();
+  highPass.type = 'highpass';
+  highPass.frequency.value = 90;
+  highPass.Q.value = 0.707;
+  const lowPass = context.createBiquadFilter();
+  lowPass.type = 'lowpass';
+  lowPass.frequency.value = 7600;
+  lowPass.Q.value = 0.707;
+  const inputGain = context.createGain();
+  inputGain.gain.value = 1.15;
+  const compressor = context.createDynamicsCompressor();
+  compressor.threshold.value = -25;
+  compressor.knee.value = 18;
+  compressor.ratio.value = 2.5;
+  compressor.attack.value = 0.012;
+  compressor.release.value = 0.22;
+  const analyserNode = context.createAnalyser();
+  analyserNode.fftSize = 512;
+  analyserNode.smoothingTimeConstant = 0.55;
+  const destination = context.createMediaStreamDestination();
+  source.connect(highPass);
+  highPass.connect(lowPass);
+  lowPass.connect(inputGain);
+  inputGain.connect(compressor);
+  compressor.connect(analyserNode);
+  analyserNode.connect(destination);
+  return { stream: destination.stream, analyser: analyserNode };
+}
+async function attachWaveAnalyser() {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return micStream;
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    if (AudioContext) { audioContext = new AudioContext(); analyser = audioContext.createAnalyser(); analyser.fftSize = 256; audioContext.createMediaStreamSource(micStream).connect(analyser); }
-    recognition = new SpeechRecognition();
-    recognition.lang = voiceLanguage;
-    recognition.interimResults = true;
-    recognition.continuous = false;
-    listening = true;
-    $('#voice-button').classList.add('listening');
-    $('#voice-button').setAttribute('aria-label', 'Stop listening');
-    $('#voice-title').textContent = 'I’m listening';
-    $('#voice-subtitle').textContent = 'Say the customer, amount, and whether it is udhaar or a payment.';
-    $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Listening… speak now</span>';
-    drawWave();
-    recognition.onresult = (event) => {
-      let transcript = '';
-      for (let i = event.resultIndex; i < event.results.length; i += 1) transcript += event.results[i][0].transcript;
-      $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(transcript)}</span>`;
-      if (event.results[event.results.length - 1].isFinal) {
-        stopListening();
-        $('#voice-title').textContent = 'Got it. Please confirm';
-        $('#voice-subtitle').textContent = 'Check the customer and amount before saving.';
-        setTimeout(() => { setVoiceReady(); prepareVoiceEntry(transcript); }, 250);
-      }
-    };
-    recognition.onerror = (event) => {
-      stopListening();
-      setVoiceReady();
-      if (event.error === 'not-allowed') toast('Allow microphone access in browser settings to use voice.');
-      else if (event.error !== 'no-speech' && event.error !== 'aborted') toast('Voice input paused. Use New entry to record this transaction.');
-    };
-    recognition.onend = () => { if (listening) stopListening(); };
-    recognition.start();
-  } catch (error) {
-    stopListening();
-    setVoiceReady();
-    toast(error.name === 'NotAllowedError' ? 'Allow microphone access in your browser to use voice.' : 'Could not start voice input. Choose New entry instead.');
+    audioContext = new AudioContext({ latencyHint: 'interactive' });
+    if (audioContext.state === 'suspended') await audioContext.resume();
+    const enhanced = createEnhancedAudioPath(micStream, audioContext);
+    analyser = enhanced.analyser;
+    return enhanced.stream;
+  } catch {
+    if (audioContext) { await audioContext.close().catch(() => {}); audioContext = null; }
+    analyser = null;
+    return micStream;
   }
 }
-function attachWaveAnalyser() {
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (AudioContext) { audioContext = new AudioContext(); analyser = audioContext.createAnalyser(); analyser.fftSize = 256; audioContext.createMediaStreamSource(micStream).connect(analyser); }
-}
 async function startGnaniRecording() {
-  if (!window.MediaRecorder) return startBrowserRecognition();
+  if (!window.MediaRecorder) throw new Error('This browser cannot record audio for Gnani.');
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const stream = await navigator.mediaDevices.getUserMedia(voiceMicrophoneConstraints());
     micStream = stream;
-    attachWaveAnalyser();
+    const enhancedStream = await attachWaveAnalyser();
     const mimeType = typeof MediaRecorder.isTypeSupported === 'function'
       ? ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find((type) => MediaRecorder.isTypeSupported(type))
       : '';
-    mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    mediaRecorder = mimeType ? new MediaRecorder(enhancedStream, { mimeType }) : new MediaRecorder(enhancedStream);
     recordedChunks = [];
     recordingHeardSpeech = false;
     recordingSilenceStartedAt = 0;
@@ -1861,16 +2454,60 @@ async function transcribeGnaniAudio(audio) {
     form.append('language_code', voiceLanguage);
     const session = await api('/api/v1/voice/sessions', { method: 'POST', body: form });
     setVoiceReady();
-    $('#voice-title').textContent = 'Got it. Please confirm';
-    $('#voice-subtitle').textContent = 'Check the transcript, customer, and amount before saving.';
+    if (session.parser_notice) toast(session.parser_notice);
+    if (session.spoken_response) {
+      $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(session.spoken_response)}</span>`;
+      const handsFreeFlowSpeaksResponse = isHandsFreeVoiceSession()
+        && ['QUERY_TODAY_SUMMARY', 'QUERY_CUSTOMER_BALANCE', 'DISAMBIGUATION', 'UNKNOWN'].includes(session.intent);
+      if (session.intent !== 'TRANSACTION' && !handsFreeFlowSpeaksResponse) speakText(session.spoken_response).catch(() => {});
+    }
+    if (session.intent === 'QUERY_TODAY_SUMMARY' || session.intent === 'QUERY_CUSTOMER_BALANCE' || session.intent === 'DISAMBIGUATION') {
+      $('#voice-title').textContent = session.needs_clarification ? 'Please clarify' : 'Here is the answer';
+      $('#voice-subtitle').textContent = session.spoken_response || 'I could not resolve that request.';
+      if (!session.spoken_response) toast('I could not resolve that request. Try again.');
+      else if (isHandsFreeVoiceSession()) finishHandsFreeAfterSpeech(session.spoken_response);
+      return;
+    }
+    if (session.intent === 'UNKNOWN') {
+      $('#voice-title').textContent = 'I could not understand';
+      $('#voice-subtitle').textContent = session.spoken_response || 'Please say the customer name, amount, and udhaar or jama.';
+      if (isHandsFreeVoiceSession()) {
+        if (handsFreeTranscriptionRetries < 1) {
+          handsFreeTranscriptionRetries += 1;
+          retryHandsFreeCapture(session.spoken_response || 'माफ़ कीजिए, समझ नहीं आया। ग्राहक का नाम, रकम और उधार या जमा बोलिए।');
+        } else failHandsFreeVoiceSession('माफ़ कीजिए, बात साफ़ समझ नहीं आई। कुछ सेव नहीं हुआ। बाद में फिर कोशिश करें।');
+      }
+      return;
+    }
+    handsFreeTranscriptionRetries = 0;
+    $('#voice-title').textContent = 'Got it. Checking details';
+    $('#voice-subtitle').textContent = 'I’ll clarify the customer if needed, then save the entry.';
     $('#voice-caption').innerHTML = `<span class="voice-dot"></span><span>${esc(session.transcript)}</span>`;
-    prepareVoiceEntry(session.transcript, session.id);
+    const firstParsedEntry = session.entries?.length > 1
+      ? { ...session.entries[0], batchEntries: session.entries }
+      : session.entries?.[0];
+    if (session.entries?.length > 1 && session.entries.some((item) => !item.customer_id)) {
+      $('#voice-title').textContent = 'Please clarify customer names';
+      $('#voice-subtitle').textContent = session.spoken_response || 'One or more customer names need clarification before saving.';
+      toast('These entries need customer clarification before saving. Nothing was added to the ledger.');
+      api(`/api/v1/voice/sessions/${session.id}/cancel`, { method: 'POST' }).catch(() => {});
+      if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession('एक से ज़्यादा ग्राहक मिले। सुरक्षा के लिए कुछ सेव नहीं किया। एक बार में एक ग्राहक की एंट्री बोलें।');
+      return;
+    }
+    prepareVoiceEntry(session.transcript, session.id, firstParsedEntry);
   } catch (error) {
     setVoiceReady('Voice transcription did not finish. Try again or use New entry.');
     toast(error.message || 'Gnani could not transcribe this recording.');
+    if (isHandsFreeVoiceSession()) {
+      if (handsFreeTranscriptionRetries < 1) {
+        handsFreeTranscriptionRetries += 1;
+        retryHandsFreeCapture('आवाज़ समझने में दिक्कत हुई। एक बार फिर बोलिए।');
+      } else failHandsFreeVoiceSession('आवाज़ समझने में दिक्कत हुई। कुछ सेव नहीं हुआ। नेटवर्क ठीक होने पर फिर कोशिश करें।');
+    }
   }
 }
 async function startListening() {
+  if (workspaceLoadError) { toast('Load your complete khata history before recording a new entry.'); return; }
   if (startingVoice || listening) return;
   if (!window.isSecureContext) { toast('Voice input needs HTTPS or localhost.'); return; }
   if (!navigator.mediaDevices?.getUserMedia) { toast('Microphone input is unavailable here. Use New entry instead.'); return; }
@@ -1878,18 +2515,13 @@ async function startListening() {
   const keepGestureButtonActive = voicePointerHoldActive;
   if (!keepGestureButtonActive) $('#voice-button').disabled = true;
   try {
-    const capabilitiesWereChecked = voiceCapabilitiesLoaded;
-    void requestVoiceCapabilities();
-    if ((!capabilitiesWereChecked || gnaniSttEnabled)
-        && window.MediaRecorder && (window.AudioContext || window.webkitAudioContext)) {
-      // Start microphone capture immediately. Do not make the shopkeeper wait
-      // for a sleeping API just to begin speaking; transcription is sent after
-      // the recording is complete and can wake the backend then.
-      await startGnaniRecording();
+    await requestVoiceCapabilities();
+    if (!gnaniSttEnabled || !gnaniTtsEnabled) {
+      toast(gnaniLastError || 'Gnani voice input and output must be enabled on the backend.');
+      setVoiceReady('Gnani voice service is unavailable. Nothing was recorded.');
       return;
     }
-    if (!window.MediaRecorder && gnaniSttEnabled) toast('This browser cannot record audio for Gnani. Trying its built-in speech recognition.');
-    await startBrowserRecognition();
+    await startGnaniRecording();
   } catch (error) {
     toast(error.message || 'Could not check voice service. Use New entry instead.');
   } finally {
@@ -1909,12 +2541,17 @@ function beginGestureVoiceCapture(onStarted = null) {
 function startAssistantVoiceWhenReady() {
   if (!assistantVoiceLaunchPending || $('#app-shell').hidden || startingVoice || listening || awaitingVoiceReply || pendingVoiceEntry) return;
   assistantVoiceLaunchPending = false;
+  if (workspaceLoadError) {
+    if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession('आपका खाता पूरा लोड नहीं हुआ। सुरक्षा के लिए अभी कोई एंट्री नहीं की। ऐप खोलकर Retry दबाएँ।');
+    else toast('Load your khata history before using voice entry.');
+    return;
+  }
   if (window.VoiceKhataNative?.hasPendingAudio?.()) {
     window.voiceKhataNativeAudioReady();
     return;
   }
   // The native Android companion records immediately with AudioRecord. It
-  // hands the WAV back here so the normal Gnani and confirmation flow remains
+  // hands the WAV back here so the normal Gnani voice flow remains
   // the single path that can create a ledger transaction.
   if (window.VoiceKhataNative?.startCapture?.()) return;
   startListening();
@@ -1939,6 +2576,10 @@ window.voiceKhataNativeAudioReady = () => {
     setVoiceReady('The recording could not be opened. Please try again.');
     toast(error.message || 'The recording could not be opened.');
   }
+};
+window.voiceKhataNativeError = (message) => {
+  if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession('आवाज़ समझने में दिक्कत हुई। कुछ सेव नहीं हुआ। दोबारा assistant button दबाकर कोशिश करें।');
+  else toast(message || 'Voice recording could not be processed.');
 };
 document.addEventListener('keydown', (event) => {
   if (event.code !== 'Space' || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
@@ -2002,9 +2643,12 @@ voiceButton.addEventListener('click', () => {
   if (awaitingVoiceReply) {
     const entry = pendingVoiceEntry;
     stopVoiceReply();
-    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     if (entry && voiceConversation) fallbackConversationToForm(entry, 'Voice questions stopped.');
-    else if (entry) showVoiceConfirmation(entry);
+    else if (entry) {
+      pendingVoiceEntry = null;
+      cancelVoiceSession(entry.sessionId);
+      setVoiceReady('Nothing was saved. Start voice entry again when ready.');
+    }
     return;
   }
   if (!listening) { startListening(); return; }

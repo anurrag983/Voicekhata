@@ -16,8 +16,25 @@ class Settings(BaseSettings):
     gnani_tts_url: str = "https://api.vachana.ai/api/v1/tts/sse"
     gnani_tts_model: str = "timbre-v2.5"
     gnani_tts_voice: str = "Nalini"
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-3.5-flash-lite"
     max_audio_bytes: int = 15 * 1024 * 1024
     access_token_minutes: int = 720
+
+    # OTP Delivery Settings (Email / SMTP)
+    smtp_host: Optional[str] = None
+    smtp_port: int = 587
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from_email: Optional[str] = None
+
+    # OTP Delivery Settings (SMS - Fast2SMS / Twilio)
+    fast2sms_api_key: Optional[str] = None
+    twilio_account_sid: Optional[str] = None
+    twilio_auth_token: Optional[str] = None
+    twilio_from_number: Optional[str] = None
+
+    otp_expire_minutes: int = 10
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

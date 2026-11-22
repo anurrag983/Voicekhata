@@ -17,3 +17,5 @@ When `GNANI_API_KEY` is set in the backend `.env`, the voice button records up t
 ## Customer history
 
 Select a customer in the digital khata or on the overview page to open their account history. The detail page loads the customer's complete ledger from the backend and shows the current balance, total udhaar, total payments, transaction dates and notes, and the running balance after each entry.
+
+The customer history page has a **Request payment on WhatsApp** action. Save the shop's UPI ID once in **Profile**; the app opens a pre-filled WhatsApp message with the customer's current outstanding balance and that UPI ID. This is a manual UPI flow: VoiceKhata cannot confirm whether a transfer succeeded. Check the shop's UPI app or bank statement, then add a `jama` entry only after confirming the money arrived.

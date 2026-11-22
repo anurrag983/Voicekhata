@@ -28,8 +28,9 @@ path.write_text(text)
 PY
 fi
 
-if [ ! -f .venv/.voicekhata-dependencies-installed ]; then
+if ! cmp -s requirements.txt .venv/.voicekhata-requirements.txt; then
   .venv/bin/python -m pip install -r requirements.txt
+  cp requirements.txt .venv/.voicekhata-requirements.txt
   touch .venv/.voicekhata-dependencies-installed
 fi
 

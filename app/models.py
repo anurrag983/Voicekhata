@@ -3,11 +3,11 @@ from __future__ import annotations
 import enum
 import unicodedata
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator, Uuid
 
@@ -60,10 +60,12 @@ class Merchant(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
+    email: Mapped[Optional[str]] = mapped_column(String(320), unique=True, index=True, nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True, nullable=True)
     password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
     owner_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     location: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    upi_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now_utc, nullable=False)
 
     customers: Mapped[list["Customer"]] = relationship(back_populates="merchant", cascade="all, delete-orphan")
@@ -97,6 +99,7 @@ class VoiceSession(Base):
     transcript: Mapped[str] = mapped_column(Text, nullable=False)
     language_code: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[VoiceStatus] = mapped_column(Enum(VoiceStatus, native_enum=False), default=VoiceStatus.pending_confirmation, nullable=False)
+    parsed_entries: Mapped[Optional[list[dict]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now_utc, nullable=False)
 
     merchant: Mapped[Merchant] = relationship(back_populates="voice_sessions")
@@ -115,8 +118,23 @@ class LedgerEntry(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     entry_type: Mapped[EntryType] = mapped_column(Enum(EntryType, native_enum=False), nullable=False)
     note: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    transaction_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now_utc, nullable=False)
 
     merchant: Mapped[Merchant] = relationship(back_populates="entries")
     customer: Mapped[Customer] = relationship(back_populates="entries")
     voice_session: Mapped[Optional[VoiceSession]] = relationship(back_populates="entry")
+
+
+class OTPRecord(Base):
+    __tablename__ = "otp_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    target: Mapped[str] = mapped_column(String(320), index=True, nullable=False)
+    target_type: Mapped[str] = mapped_column(String(10), nullable=False)  # "phone" or "email"
+    otp_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), index=True, nullable=False)  # "registration" or "reset_password"
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now_utc, nullable=False)
