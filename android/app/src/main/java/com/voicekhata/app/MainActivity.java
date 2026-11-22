@@ -6,6 +6,7 @@ import android.app.AlertDialog;
 import android.app.KeyguardManager;
 import android.app.role.RoleManager;
 import android.content.Intent;
+import android.content.ClipData;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -42,6 +43,8 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -76,10 +79,12 @@ public final class MainActivity extends Activity {
     private TextToSpeech nativeTts;
     private boolean nativeTtsReady;
     private boolean nativePromptInProgress;
+    private boolean nativeReplyCaptureInProgress;
     private boolean waitingForKeyguardDismiss;
     private String assistantWebUrl;
     private PermissionRequest pendingWebPermissionRequest;
     private boolean assistantLaunchPending;
+    private boolean webPageReady;
     private boolean waitingForAssistantPermission;
     private boolean waitingForSetupPermission;
     private boolean waitingToOpenAfterPermission;
@@ -295,10 +300,10 @@ public final class MainActivity extends Activity {
         addSetupButton(layout, microphone);
         microphone.setOnClickListener(view -> requestMicrophoneForSetup());
 
-        addSetupHeading(layout, "2. Choose VoiceKhata as your assistant");
+        addSetupHeading(layout, "2. Choose or change your assistant");
         assistantStatus = text("Not selected yet", 13);
         layout.addView(assistantStatus);
-        Button assistant = button("Choose VoiceKhata");
+        Button assistant = button("Open assistant selection");
         addSetupButton(layout, assistant);
         assistant.setOnClickListener(view -> requestAssistantSelection());
 
@@ -529,6 +534,12 @@ public final class MainActivity extends Activity {
         webView.addJavascriptInterface(new NativeVoiceBridge(), "VoiceKhataNative");
         webView.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageStarted(WebView view, String pageUrl, android.graphics.Bitmap favicon) {
+                super.onPageStarted(view, pageUrl, favicon);
+                webPageReady = false;
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri destination = request.getUrl();
                 Uri origin = Uri.parse(preferences().getString(PREF_WEB_URL, ""));
@@ -540,6 +551,7 @@ public final class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String pageUrl) {
                 super.onPageFinished(view, pageUrl);
+                webPageReady = true;
                 boolean launchedByAssistant = assistantLaunchPending;
                 installNativeAudioHandoff(view);
                 continueAssistantLaunch();
@@ -609,6 +621,23 @@ public final class MainActivity extends Activity {
             return true;
         }
 
+        /** Native capture for a spoken follow-up answer (for example, existing or new customer). */
+        @JavascriptInterface
+        public boolean startReplyCapture() {
+            if (!handsFreeAssistantSession || finishedHandsFreeSession || !hasMicrophonePermission()) return false;
+            runOnUiThread(MainActivity.this::beginNativeReplyCapture);
+            return true;
+        }
+
+        @JavascriptInterface
+        public void cancelReplyCapture() {
+            runOnUiThread(() -> {
+                if (!nativeReplyCaptureInProgress) return;
+                nativeReplyCaptureInProgress = false;
+                if (audioRecorder != null) audioRecorder.cancel();
+            });
+        }
+
         @JavascriptInterface
         public void finishCapture() {
             if (audioRecorder != null) audioRecorder.finish();
@@ -651,6 +680,38 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void transcribePendingAudio(String apiBaseUrl, String accessToken) {
             uploadPendingNativeAudio(apiBaseUrl, accessToken);
+        }
+
+        @JavascriptInterface
+        public boolean sharePaymentQr(String imageBase64, String message) {
+            if (imageBase64 == null || imageBase64.isBlank() || imageBase64.length() > 100_000) return false;
+            runOnUiThread(() -> launchPaymentQrShare(imageBase64, message));
+            return true;
+        }
+    }
+
+    private void launchPaymentQrShare(String imageBase64, String message) {
+        try {
+            byte[] image = android.util.Base64.decode(imageBase64, android.util.Base64.DEFAULT);
+            File sharedImage = new File(getCacheDir(), "voicekhata-payment-qr.png");
+            try (FileOutputStream output = new FileOutputStream(sharedImage, false)) {
+                output.write(image);
+            }
+            Uri imageUri = new Uri.Builder()
+                    .scheme("content")
+                    .authority(getPackageName() + ".paymentshare")
+                    .appendPath("payment-qr.png")
+                    .build();
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setType("image/png");
+            share.putExtra(Intent.EXTRA_STREAM, imageUri);
+            share.putExtra(Intent.EXTRA_TEXT, message == null ? "" : message);
+            share.setClipData(ClipData.newUri(getContentResolver(), "VoiceKhata payment QR", imageUri));
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(share, "Send payment request"));
+        } catch (Exception error) {
+            Log.e(LOG_TAG, "Could not open payment QR share sheet.", error);
+            Toast.makeText(this, "Could not share the QR image. Please try WhatsApp again.", Toast.LENGTH_LONG).show();
         }
     }
 
@@ -728,6 +789,42 @@ public final class MainActivity extends Activity {
         }));
     }
 
+    private void beginNativeReplyCapture() {
+        if (!handsFreeAssistantSession || finishedHandsFreeSession || audioRecorder != null) {
+            notifyNativeReplyError("माइक्रोफ़ोन शुरू नहीं हो पाया। कृपया फिर से बोलें।");
+            return;
+        }
+        nativeReplyCaptureInProgress = true;
+        Log.i(LOG_TAG, "Starting native microphone capture for a spoken follow-up answer.");
+        audioRecorder = new AudioRecorder(this);
+        vibrateForCapture();
+        showHandsFreeOverlay("जवाब सुन रहा हूँ…");
+        AudioRecorder replyRecorder = audioRecorder;
+        replyRecorder.start((wav, error) -> runOnUiThread(() -> {
+            if (audioRecorder == replyRecorder) audioRecorder = null;
+            if (!nativeReplyCaptureInProgress) return;
+            nativeReplyCaptureInProgress = false;
+            if (!handsFreeAssistantSession || finishedHandsFreeSession) return;
+            if (error != null || wav == null) {
+                Log.w(LOG_TAG, "Native follow-up recording failed: " + (error == null ? "no audio" : error));
+                notifyNativeReplyError(error == null ? "आपका जवाब सुनाई नहीं दिया। फिर से बोलें।" : error);
+                return;
+            }
+            pendingNativeAudio = wav;
+            Log.i(LOG_TAG, "Native follow-up recording finished; WAV bytes=" + wav.length + ".");
+            updateHandsFreeStatus("आपका जवाब समझ रहा हूँ…");
+            if (webView != null) webView.evaluateJavascript(
+                    "window.voiceKhataNativeReplyAudioReady ? window.voiceKhataNativeReplyAudioReady() : false", null);
+            else notifyNativeReplyError("VoiceKhata फिर से खोलकर जवाब दें।");
+        }));
+    }
+
+    private void notifyNativeReplyError(String message) {
+        if (webView == null) return;
+        webView.evaluateJavascript("window.voiceKhataNativeReplyError && window.voiceKhataNativeReplyError("
+                + JSONObject.quote(message) + ")", null);
+    }
+
     private void installNativeAudioHandoff(WebView target) {
         String script = "(function(){"
                 + "if(window.__voiceKhataNativeHandoff)return true;window.__voiceKhataNativeHandoff=true;"
@@ -797,6 +894,11 @@ public final class MainActivity extends Activity {
 
     private void finishHandsFreeSession() {
         if (finishedHandsFreeSession) return;
+        if (nativeReplyCaptureInProgress && audioRecorder != null) {
+            nativeReplyCaptureInProgress = false;
+            audioRecorder.cancel();
+            audioRecorder = null;
+        }
         finishedHandsFreeSession = true;
         handsFreeAssistantSession = false;
         assistantLaunchPending = false;
@@ -1130,16 +1232,23 @@ public final class MainActivity extends Activity {
     }
 
     private void continueAssistantLaunch() {
-        if (!assistantLaunchPending || webView == null) return;
+        if (!assistantLaunchPending || webView == null || !webPageReady) return;
         Log.i(LOG_TAG, "Assistant launch continuing; microphonePermission=" + hasMicrophonePermission());
         if (!hasMicrophonePermission()) {
             waitingForAssistantPermission = true;
             requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, REQUEST_MICROPHONE);
             return;
         }
-        assistantLaunchPending = false;
         webView.post(() -> webView.evaluateJavascript(
-                "window.voiceKhataAssistantLaunch ? window.voiceKhataAssistantLaunch() : false", null));
+                "window.voiceKhataAssistantLaunch ? window.voiceKhataAssistantLaunch() : false", result -> {
+                    if ("true".equals(result)) {
+                        assistantLaunchPending = false;
+                    } else if (assistantLaunchPending && webPageReady && webView != null) {
+                        // The page can finish loading before its final app.js bootstrap has
+                        // installed the bridge callback. Keep the hardware gesture pending.
+                        webView.postDelayed(this::continueAssistantLaunch, 250);
+                    }
+                }));
     }
 
     private boolean sameOrigin(Uri first, Uri second) {
@@ -1199,11 +1308,9 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             RoleManager roleManager = getSystemService(RoleManager.class);
             if (roleManager != null && roleManager.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
-                if (roleManager.isRoleHeld(RoleManager.ROLE_ASSISTANT)) {
-                    Toast.makeText(this, "VoiceKhata is already your selected assistant.", Toast.LENGTH_LONG).show();
-                } else {
-                    startActivityForResult(roleManager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT), REQUEST_ASSISTANT_ROLE);
-                }
+                // Always reopen Android's assistant picker from this setup task, even
+                // after VoiceKhata was selected, so the user can review/change it.
+                startActivityForResult(roleManager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT), REQUEST_ASSISTANT_ROLE);
                 return;
             }
         }

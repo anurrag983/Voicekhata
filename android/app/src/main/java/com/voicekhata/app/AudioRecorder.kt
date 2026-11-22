@@ -68,7 +68,10 @@ class AudioRecorder(private val context: Context) {
 
         val recorder = try {
             AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                // This is a speech-recognition capture, not a call. VOICE_COMMUNICATION
+                // can apply call-oriented processing that suppresses quiet speech on some
+                // OEM devices; VOICE_RECOGNITION is the appropriate input profile here.
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,

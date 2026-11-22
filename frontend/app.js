@@ -41,6 +41,7 @@ let startingVoice = false;
 let awaitingVoiceReply = false;
 let voiceReplyRecognition = null;
 let voiceReplyRecorder = null;
+let nativeVoiceReplyHandlers = null;
 let voiceReplyStream = null;
 let voiceReplyProcessedStream = null;
 let voiceReplyContext = null;
@@ -1079,7 +1080,16 @@ $('#home-customers').addEventListener('click', (event) => {
 });
 $('#customer-back').addEventListener('click', () => go('khata'));
 $('#customer-detail-new-entry').addEventListener('click', () => openEntry(selectedCustomerId));
-$('#customer-payment-request-whatsapp').addEventListener('click', () => {
+function paymentQrFile() {
+  const encoded = window.VOICEKHATA_PAYMENT_QR_BASE64 || '';
+  if (!encoded) return null;
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return new File([bytes], 'VoiceKhata-payment-QR.png', { type: 'image/png' });
+}
+
+$('#customer-payment-request-whatsapp').addEventListener('click', async () => {
   const customer = customers.find((item) => item.id === selectedCustomerId);
   if (!customer) return;
   if (workspaceLoadError) { toast('Load the complete khata history before requesting payment.'); return; }
@@ -1097,9 +1107,33 @@ $('#customer-payment-request-whatsapp').addEventListener('click', () => {
   const shopName = profile.shopName || 'our shop';
   const amount = money(due);
   const message = `Hello ${customerName}, your outstanding balance at ${shopName} is ${amount}. You can pay directly to this UPI ID: ${profile.upiId}. Please let me know after payment so I can verify it and update your khata.\n\nनमस्ते ${customerName} जी, ${shopName} के खाते में आपके ${amount} बाकी हैं। कृपया इस UPI ID पर भुगतान करें: ${profile.upiId}। भुगतान करने के बाद मुझे बता दें, ताकि मैं पुष्टि करके आपका खाता अपडेट कर सकूँ।`;
-  const target = phone ? `https://wa.me/${phone}?text=${encodeURIComponent(message)}` : `https://wa.me/?text=${encodeURIComponent(message)}`;
+  const qrUrl = new URL('./payment-qr.png', window.location.href).href;
+  const messageWithQrLink = `${message}\n\nPayment QR: ${qrUrl}`;
+  const qrData = window.VOICEKHATA_PAYMENT_QR_BASE64 || '';
+
+  // The Android companion can attach the QR directly to its system share sheet.
+  if (qrData && window.VoiceKhataNative?.sharePaymentQr?.(qrData, messageWithQrLink)) {
+    toast('Choose WhatsApp and the customer to share the payment request with its QR. Verify the payment yourself before recording it.');
+    return;
+  }
+
+  // Browsers that support file sharing can send the QR image and caption together.
+  const qrFile = paymentQrFile();
+  if (qrFile && navigator.share && navigator.canShare?.({ files: [qrFile] })) {
+    try {
+      await navigator.share({ files: [qrFile], title: `Payment request for ${customerName}`, text: messageWithQrLink });
+      toast('Choose WhatsApp and the customer to share the payment request with its QR. Verify the payment yourself before recording it.');
+      return;
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+    }
+  }
+
+  // Keep direct-to-customer chat on browsers without image sharing; the QR link
+  // remains in the prefilled WhatsApp message so the customer can open it.
+  const target = phone ? `https://wa.me/${phone}?text=${encodeURIComponent(messageWithQrLink)}` : `https://wa.me/?text=${encodeURIComponent(messageWithQrLink)}`;
   window.open(target, '_blank', 'noopener,noreferrer');
-  toast('Payment request opened in WhatsApp. Verify the payment yourself before recording it.');
+  toast('Payment request opened in WhatsApp with the payment QR link. Verify the payment yourself before recording it.');
 });
 $('#customer-history-rows').addEventListener('click', (event) => {
   if (event.target.closest('[data-retry-customer-history]')) loadCustomerLedger(selectedCustomerId);
@@ -1537,7 +1571,9 @@ function fallbackConversationToForm(entry, message) {
 async function askConversationQuestion(entry, prompt, onAnswer, options = {}) {
   await requestVoiceCapabilities();
   pendingVoiceEntry = entry;
-  const canUseGnaniForAnswers = gnaniSttEnabled && window.MediaRecorder && navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext);
+  const nativeReplyCaptureAvailable = isHandsFreeVoiceSession() && typeof window.VoiceKhataNative?.startReplyCapture === 'function';
+  const browserReplyCaptureAvailable = window.MediaRecorder && navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext);
+  const canUseGnaniForAnswers = gnaniSttEnabled && (nativeReplyCaptureAvailable || browserReplyCaptureAvailable);
   if (!canUseGnaniForAnswers || !gnaniTtsEnabled) {
     fallbackConversationToForm(entry, 'Hands-free questions are not available in this browser.');
     return;
@@ -1977,6 +2013,16 @@ function listenForGnaniReply(entry, onReply, onFallback) {
   const finishRecording = () => {
     if (voiceReplyRecorder?.state === 'recording') voiceReplyRecorder.stop();
   };
+  if (isHandsFreeVoiceSession() && typeof window.VoiceKhataNative?.startReplyCapture === 'function') {
+    nativeVoiceReplyHandlers = { entry, onReply, onFallback: finishFallback };
+    $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Listening… speak your answer</span>';
+    updateHandsFreeStatus('जवाब सुन रहा हूँ…');
+    if (!window.VoiceKhataNative.startReplyCapture()) {
+      nativeVoiceReplyHandlers = null;
+      finishFallback('Could not start the phone microphone. Please try again.');
+    }
+    return;
+  }
   (async () => {
     try {
       voiceReplyStream = await navigator.mediaDevices.getUserMedia(voiceMicrophoneConstraints());
@@ -2051,6 +2097,10 @@ function listenForGnaniReply(entry, onReply, onFallback) {
 function stopVoiceReply() {
   awaitingVoiceReply = false;
   if (voiceReplyTimer) { clearTimeout(voiceReplyTimer); voiceReplyTimer = null; }
+  if (nativeVoiceReplyHandlers) {
+    nativeVoiceReplyHandlers = null;
+    try { window.VoiceKhataNative?.cancelReplyCapture?.(); } catch {}
+  }
   const active = voiceReplyRecognition;
   voiceReplyRecognition = null;
   if (active) { active.onresult = null; active.onerror = null; active.onend = null; try { active.abort(); } catch {} }
@@ -2077,6 +2127,10 @@ function showVoiceReplyFallback(entry, message) {
 }
 function listenForVoiceConfirmation(entry, onReply = null, onFallback = null) {
   if (!awaitingVoiceReply || pendingVoiceEntry !== entry) return;
+  if (isHandsFreeVoiceSession() && typeof window.VoiceKhataNative?.startReplyCapture === 'function') {
+    listenForGnaniReply(entry, onReply, onFallback);
+    return;
+  }
   if (gnaniSttEnabled && window.MediaRecorder && navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext)) {
     listenForGnaniReply(entry, onReply, onFallback);
     return;
@@ -2584,6 +2638,40 @@ window.voiceKhataNativeAudioReady = () => {
     setVoiceReady('The recording could not be opened. Please try again.');
     toast(error.message || 'The recording could not be opened.');
   }
+};
+window.voiceKhataNativeReplyAudioReady = async () => {
+  const handlers = nativeVoiceReplyHandlers;
+  if (!handlers || !awaitingVoiceReply || pendingVoiceEntry !== handlers.entry) {
+    try { window.VoiceKhataNative?.consumeAudioBase64?.(); } catch {}
+    return;
+  }
+  try {
+    const encoded = window.VoiceKhataNative?.consumeAudioBase64?.();
+    if (!encoded) throw new Error('I did not receive your answer. Please say it again.');
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const form = new FormData();
+    form.append('audio', new Blob([bytes], { type: 'audio/wav' }), 'voice-answer.wav');
+    form.append('language_code', voiceLanguage);
+    $('#voice-caption').innerHTML = '<span class="voice-dot"></span><span>Checking your answer…</span>';
+    updateHandsFreeStatus('आपका जवाब समझ रहा हूँ…');
+    const result = await api('/api/v1/voice/transcribe', { method: 'POST', body: form });
+    if (nativeVoiceReplyHandlers !== handlers || !awaitingVoiceReply || pendingVoiceEntry !== handlers.entry) return;
+    nativeVoiceReplyHandlers = null;
+    stopVoiceReply();
+    handlers.onReply(result.transcript);
+  } catch (error) {
+    if (nativeVoiceReplyHandlers !== handlers) return;
+    nativeVoiceReplyHandlers = null;
+    handlers.onFallback(error.message || 'Could not understand your answer. Please try again.');
+  }
+};
+window.voiceKhataNativeReplyError = (message) => {
+  const handlers = nativeVoiceReplyHandlers;
+  if (!handlers) return;
+  nativeVoiceReplyHandlers = null;
+  handlers.onFallback(message || 'I did not hear your answer. Please try again.');
 };
 window.voiceKhataNativeError = (message) => {
   if (isHandsFreeVoiceSession()) failHandsFreeVoiceSession('आवाज़ समझने में दिक्कत हुई। कुछ सेव नहीं हुआ। दोबारा assistant button दबाकर कोशिश करें।');

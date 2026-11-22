@@ -48,5 +48,11 @@
                 <action android:name="android.service.voice.VoiceInteractionSessionService" />
             </intent-filter>
         </service>
+
+        <provider
+            android:name=".PaymentShareProvider"
+            android:authorities="${applicationId}.paymentshare"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>
